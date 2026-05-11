@@ -4348,6 +4348,11 @@ void omni_free(struct omni_context * ctx_omni) {
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
         
+        // Free fused TTS condition graph before releasing shared projector backend.
+        if (ctx_omni->tts_condition_graph.initialized) {
+            tts_condition_graph_free(ctx_omni);
+        }
+        
         // Free TTS weights
         if (ctx_omni->emb_code_weight) {
             free(ctx_omni->emb_code_weight);
@@ -6866,12 +6871,66 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             // 这样 TTS 会 flush 剩余的 tts_token_buffer，并正确处理 text_eos_embed
             bool is_final_text_chunk = llm_finish;
             
+            // TTSCUDA=1: use fused ggml graph for emb_text + projector + normalize + merge.
+            const char * ttscuda_env = std::getenv("TTSCUDA");
+            bool use_tts_condition_graph = (ttscuda_env != nullptr && std::strcmp(ttscuda_env, "1") == 0);
+            if (use_tts_condition_graph) {
+                int graph_tts_n_embd = 0;
+                const bool graph_was_initialized = ctx_omni->tts_condition_graph.initialized;
+                int64_t graph_init_us = 0;
+                bool graph_ready = graph_was_initialized;
+                if (!graph_ready) {
+                    const int64_t graph_init_start_us = ggml_time_us();
+                    graph_ready = tts_condition_graph_init(ctx_omni, true);
+                    graph_init_us = ggml_time_us() - graph_init_start_us;
+                    print_with_timestamp("TTS condition graph init: success=%d, elapsed=%.3f ms\n",
+                                         graph_ready ? 1 : 0, graph_init_us / 1000.0);
+                }
+
+                const int64_t graph_forward_start_us = ggml_time_us();
+                bool graph_forward_ok = graph_ready &&
+                                        tts_condition_graph_forward(ctx_omni,
+                                                                    filtered_token_ids.data(),
+                                                                    filtered_hidden_states.data(),
+                                                                    n_tokens_filtered,
+                                                                    current_chunk_n_embd,
+                                                                    merged_embeddings,
+                                                                    graph_tts_n_embd);
+                const int64_t graph_forward_us = ggml_time_us() - graph_forward_start_us;
+
+                if (graph_forward_ok) {
+                    if (graph_tts_n_embd == tts_n_embd) {
+                        merged_success = true;
+                        print_with_timestamp("TTS condition build [ggml]: chunk_idx=%d, n_tokens=%d, llm_n_embd=%d, tts_n_embd=%d, elapsed=%.3f ms%s\n",
+                                             current_chunk_idx,
+                                             n_tokens_filtered,
+                                             current_chunk_n_embd,
+                                             tts_n_embd,
+                                             graph_forward_us / 1000.0,
+                                             graph_was_initialized ? "" : " (init excluded)");
+                    } else {
+                        LOG_ERR("TTS: condition graph tts_n_embd mismatch: got %d, expected %d; falling back\n",
+                                graph_tts_n_embd, tts_n_embd);
+                        merged_embeddings.clear();
+                    }
+                } else {
+                    print_with_timestamp("TTS condition build [ggml]: failed, elapsed=%.3f ms, falling back to legacy path\n",
+                                         graph_forward_us / 1000.0);
+                }
+            }
+
             // Try to compute merged embeddings if weights are available
-            if (ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
+            if (!merged_success && ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
+                int64_t legacy_emb_text_us = 0;
+                int64_t legacy_projector_us = 0;
+                int64_t legacy_normalize_us = 0;
+                int64_t legacy_merge_us = 0;
+
                 // Step 1: Convert token IDs to embeddings using emb_text (using filtered tokens)
                 std::vector<float> llm_embeds(n_tokens_filtered * tts_n_embd, 0.0f);
                 bool emb_text_success = true;
                 
+                const int64_t legacy_emb_text_start_us = ggml_time_us();
                 for (int i = 0; i < n_tokens_filtered; i++) {
                     llama_token token_id = filtered_token_ids[i];
                     float * emb = llm_embeds.data() + i * tts_n_embd;
@@ -6880,6 +6939,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                         break;
                     }
                 }
+                legacy_emb_text_us = ggml_time_us() - legacy_emb_text_start_us;
                 
                 if (emb_text_success) {
                     // Debug: Save llm_embeds for comparison
@@ -6904,12 +6964,14 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     
                     // Step 2: Project hidden states using projector_semantic (using filtered hidden states)
                     std::vector<float> projected_hidden(n_tokens_filtered * tts_n_embd, 0.0f);
+                    const int64_t legacy_projector_start_us = ggml_time_us();
                     bool projector_success = tts_projector_semantic(ctx_omni,
                                                                      filtered_hidden_states.data(),
                                                                      n_tokens_filtered,
                                                                      current_chunk_n_embd,
                                                                      projected_hidden.data(),
                                                                      tts_n_embd);
+                    legacy_projector_us = ggml_time_us() - legacy_projector_start_us;
                     
                     if (projector_success) {
                         // Debug: Save projected_hidden before normalization for comparison
@@ -6954,7 +7016,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                         }
                         
                         // CRITICAL: Normalize projected_hidden before merging
+                        const int64_t legacy_normalize_start_us = ggml_time_us();
                         normalize_l2_per_token(projected_hidden.data(), n_tokens_filtered, tts_n_embd);
+                        legacy_normalize_us = ggml_time_us() - legacy_normalize_start_us;
                         
                         // Debug: Save projected_hidden after normalization for comparison
                         {
@@ -7030,10 +7094,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                             break;  // 跳过这个 chunk，避免崩溃
                         }
                         
+                        const int64_t legacy_merge_start_us = ggml_time_us();
                         merged_embeddings.resize(merge_size);
                         for (size_t i = 0; i < merge_size; i++) {
                             merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
                         }
+                        legacy_merge_us = ggml_time_us() - legacy_merge_start_us;
                         
                         // 🔧 [修复] 不在 merge embed 阶段添加 audio_bos
                         // Python 中 audio_bos 是在 TTS 类内部（prefill 前）添加的
@@ -7041,6 +7107,16 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                         // 这样可以确保 audio_bos 使用正确的 embedding 权重和位置
                         
                         merged_success = true;
+                        print_with_timestamp("TTS condition build [legacy]: chunk_idx=%d, n_tokens=%d, llm_n_embd=%d, tts_n_embd=%d, elapsed=%.3f ms (emb_text=%.3f, projector=%.3f, normalize=%.3f, merge=%.3f)\n",
+                                             current_chunk_idx,
+                                             n_tokens_filtered,
+                                             current_chunk_n_embd,
+                                             tts_n_embd,
+                                             (legacy_emb_text_us + legacy_projector_us + legacy_normalize_us + legacy_merge_us) / 1000.0,
+                                             legacy_emb_text_us / 1000.0,
+                                             legacy_projector_us / 1000.0,
+                                             legacy_normalize_us / 1000.0,
+                                             legacy_merge_us / 1000.0);
                         
                         // Debug: Verify merged_embeddings calculation
                         if (n_tokens_filtered > 0) {
@@ -7052,7 +7128,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                         print_with_timestamp("TTS: WARNING - projector_semantic failed, skipping merged embedding save\n");
                     }
                 }
-            } else {
+            } else if (!merged_success) {
                 print_with_timestamp("TTS: WARNING - TTS weights not loaded, skipping merged embedding computation\n");
             }
             
@@ -7121,6 +7197,11 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                         // Write merged embeddings data
                         fwrite(merged_embeddings.data(), sizeof(float), merged_embeddings.size(), f_merged);
                         fclose(f_merged);
+                    }
+
+                    std::string merged_tensor_file = chunk_dir + "/merged_embeddings_tensor.txt";
+                    if (!dumptensor(merged_tensor_file, merged_embeddings.data(), tts_n_embd, n_tokens_filtered, 1)) {
+                        LOG_WRN("TTS: failed to dump merged embeddings tensor to %s\n", merged_tensor_file.c_str());
                     }
                     
                     // 6. Save merged embeddings as text (for easy inspection)

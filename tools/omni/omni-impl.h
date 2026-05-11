@@ -203,6 +203,35 @@ static std::string string_format(const char * fmt, ...) {
     return std::string(buf.data(), buf.size());
 }
 
+// Dump a contiguous [dim, len, batch, 1] tensor with dim as the fastest axis.
+// The output is plain text: one row per (len, batch), dim values per row.
+static bool dumptensor(const std::string & path, const float * data, int dim, int len, int batch) {
+    if (!data || dim <= 0 || len <= 0 || batch <= 0) {
+        LOG_ERR("dumptensor: invalid tensor args path=%s dim=%d len=%d batch=%d\n",
+                path.c_str(), dim, len, batch);
+        return false;
+    }
+
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f) {
+        LOG_ERR("dumptensor: failed to open %s for writing\n", path.c_str());
+        return false;
+    }
+
+    for (int b = 0; b < batch; ++b) {
+        for (int l = 0; l < len; ++l) {
+            const float * row = data + ((size_t)b * (size_t)len + (size_t)l) * (size_t)dim;
+            for (int d = 0; d < dim; ++d) {
+                fprintf(f, d == 0 ? "%.6f" : " %.6f", row[d]);
+            }
+            fprintf(f, "\n");
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
 
 
 

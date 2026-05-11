@@ -8,6 +8,8 @@ option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
 add_library(omni
             omni.cpp
             omni.h
+            tts-condition-graph.cpp
+            tts-condition-graph.h
             audition.cpp
             audition.h
             vision.cpp

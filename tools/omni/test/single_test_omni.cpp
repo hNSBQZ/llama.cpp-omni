@@ -176,6 +176,8 @@ static void show_usage(const char * prog_name) {
         "  --tts <path>             覆盖 TTS 模型路径\n"
         "  --projector <path>       覆盖 projector 模型路径\n"
         "  --ref-audio <path>       参考音频路径 (voice clone)\n"
+        "  --output-dir <path>      输出目录 (默认 ./tools/omni/output)\n"
+        "  -s, --seed <n>           采样随机种子 (默认 42)\n"
         "  -c, --ctx-size <n>       上下文大小 (默认 4096)\n"
         "  -ngl <n>                 GPU 层数 (默认 99)\n"
         "  --no-tts                 禁用 TTS\n"
@@ -202,9 +204,11 @@ int main(int argc, char ** argv) {
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
     int n_ctx = 4096;
     int n_gpu_layers = 99;
+    uint32_t seed = 42;
     bool use_tts = true;
     std::string test_audio_prefix;
     int test_count = 0;
+    std::string output_dir = "./tools/omni/output";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -224,6 +228,10 @@ int main(int argc, char ** argv) {
             projector_path_override = argv[++i];
         } else if (arg == "--ref-audio" && i + 1 < argc) {
             ref_audio_path = argv[++i];
+        } else if (arg == "--output-dir" && i + 1 < argc) {
+            output_dir = argv[++i];
+        } else if ((arg == "-s" || arg == "--seed") && i + 1 < argc) {
+            seed = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         } else if ((arg == "-c" || arg == "--ctx-size") && i + 1 < argc) {
             n_ctx = std::atoi(argv[++i]);
         } else if (arg == "-ngl" && i + 1 < argc) {
@@ -288,6 +296,7 @@ int main(int argc, char ** argv) {
     params.vpm_model  = paths.vision;
     params.apm_model  = paths.audio;
     params.tts_model  = paths.tts;
+    params.sampling.seed = seed;
     if (vision_backend == "coreml") {
         if (vision_coreml_model_path.empty()) {
             vision_coreml_model_path = paths.vision_coreml;
@@ -311,9 +320,12 @@ int main(int argc, char ** argv) {
     }
     printf("  TTS bin dir:   %s\n", tts_bin_dir.c_str());
     printf("  Ref audio:     %s\n", ref_audio_path.c_str());
+    printf("  Output dir:    %s\n", output_dir.c_str());
+    printf("  Seed:          %u\n", seed);
 
     // media_type=2 表示 omni 模式（audio + vision）
-    auto ctx_omni = omni_init(&params, /*media_type=*/2, use_tts, tts_bin_dir, -1, "gpu:0");
+    auto ctx_omni = omni_init(&params, /*media_type=*/2, use_tts, tts_bin_dir, -1, "gpu:0",
+                              false, nullptr, nullptr, output_dir);
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;
