@@ -370,6 +370,7 @@ struct omni_context {
     
     // Timestamp for stream_decode start (used for WAV file naming)
     std::chrono::high_resolution_clock::time_point stream_decode_start_time;
+    std::atomic<int> perf_current_chunk_index{-1};
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
@@ -440,6 +441,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
                                 const std::string & base_output_dir = "./tools/omni/output");
+
+void omni_perf_mark(struct omni_context * ctx_omni,
+                    const char * stage,
+                    const char * event,
+                    int chunk_index = -1,
+                    double duration_ms = -1.0,
+                    const char * detail = nullptr);
 
 void omni_free(struct omni_context * ctx_omni);
 

@@ -147,12 +147,16 @@ static void duplex_test_case(struct omni_context * ctx_omni,
         } else {
             printf("  音频: %s\n", aud_fname.c_str());
         }
+        ctx_omni->perf_current_chunk_index.store(il);
 
         // Step 1: Prefill
         auto t0 = std::chrono::high_resolution_clock::now();
+        std::string prefill_detail = "audio=" + aud_fname + ",image=" + (img_fname.empty() ? "none" : img_fname);
+        omni_perf_mark(ctx_omni, "test.chunk_prefill_api", "start", il, -1.0, prefill_detail.c_str());
         bool prefill_ok = stream_prefill(ctx_omni, aud_fname, img_fname, il);
         auto t1 = std::chrono::high_resolution_clock::now();
         double prefill_dt = std::chrono::duration<double>(t1 - t0).count();
+        omni_perf_mark(ctx_omni, "test.chunk_prefill_api", "end", il, prefill_dt * 1000.0, prefill_detail.c_str());
 
         if (!prefill_ok) {
             fprintf(stderr, "[错误] Chunk %d prefill 失败\n", il);
@@ -161,9 +165,11 @@ static void duplex_test_case(struct omni_context * ctx_omni,
 
         // Step 2: Decode
         auto t2 = std::chrono::high_resolution_clock::now();
+        omni_perf_mark(ctx_omni, "test.chunk_decode_api", "start", il, -1.0, nullptr);
         bool decode_ok = stream_decode(ctx_omni, "./");
         auto t3 = std::chrono::high_resolution_clock::now();
         double decode_dt = std::chrono::duration<double>(t3 - t2).count();
+        omni_perf_mark(ctx_omni, "test.chunk_decode_api", "end", il, decode_dt * 1000.0, nullptr);
 
         if (!decode_ok) {
             fprintf(stderr, "[错误] Chunk %d decode 失败\n", il);
@@ -368,7 +374,7 @@ int main(int argc, char ** argv) {
 
     // 关键: duplex_mode=true
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"gpu:0",
                               /*duplex_mode=*/true,
                               /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                               /*base_output_dir=*/output_dir);
