@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="530" viewBox="0 0 1180 530">
+<style>
+text{font-family:Arial,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172033}
+.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#5b6475}
+.label{font-size:13px}.small{font-size:11px;fill:#5b6475}.tiny{font-size:10px;fill:#5b6475}
+.lane{fill:#f6f8fb;stroke:#d6dde8}.box{rx:12;ry:12;stroke:#29415f;stroke-width:1.2}
+</style>
+<rect width="1180" height="530" fill="#ffffff"/>
+<text x="40" y="42" class="title">异步重叠时间线：约 0.85s 到 1.40s</text>
+<text x="40" y="66" class="subtitle">TTS/T2W 与下一轮 prefill/decode 同时运行；chunk 标签按日志原值显示</text>
+<line x1="210.0" y1="80" x2="210.0" y2="455" stroke="#edf1f7"/>
+<text x="196.0" y="478" class="tiny">850</text>
+<line x1="291.8" y1="80" x2="291.8" y2="455" stroke="#edf1f7"/>
+<text x="277.8" y="478" class="tiny">900</text>
+<line x1="373.6" y1="80" x2="373.6" y2="455" stroke="#edf1f7"/>
+<text x="359.6" y="478" class="tiny">950</text>
+<line x1="455.5" y1="80" x2="455.5" y2="455" stroke="#edf1f7"/>
+<text x="441.5" y="478" class="tiny">1000</text>
+<line x1="537.3" y1="80" x2="537.3" y2="455" stroke="#edf1f7"/>
+<text x="523.3" y="478" class="tiny">1050</text>
+<line x1="619.1" y1="80" x2="619.1" y2="455" stroke="#edf1f7"/>
+<text x="605.1" y="478" class="tiny">1100</text>
+<line x1="700.9" y1="80" x2="700.9" y2="455" stroke="#edf1f7"/>
+<text x="686.9" y="478" class="tiny">1150</text>
+<line x1="782.7" y1="80" x2="782.7" y2="455" stroke="#edf1f7"/>
+<text x="768.7" y="478" class="tiny">1200</text>
+<line x1="864.5" y1="80" x2="864.5" y2="455" stroke="#edf1f7"/>
+<text x="850.5" y="478" class="tiny">1250</text>
+<line x1="946.4" y1="80" x2="946.4" y2="455" stroke="#edf1f7"/>
+<text x="932.4" y="478" class="tiny">1300</text>
+<line x1="1028.2" y1="80" x2="1028.2" y2="455" stroke="#edf1f7"/>
+<text x="1014.2" y="478" class="tiny">1350</text>
+<line x1="1110.0" y1="80" x2="1110.0" y2="455" stroke="#edf1f7"/>
+<text x="1096.0" y="478" class="tiny">1400</text>
+<rect x="40" y="66" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>
+<text x="58" y="91" class="label" font-weight="700">main.prefill</text>
+<rect x="40" y="158" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>
+<text x="58" y="183" class="label" font-weight="700">llm</text>
+<rect x="40" y="250" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>
+<text x="58" y="275" class="label" font-weight="700">tts</text>
+<rect x="40" y="342" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>
+<text x="58" y="367" class="label" font-weight="700">t2w</text>
+<rect x="210.0" y="98.0" width="19.2" height="13" fill="#77aadd" rx="3"/>
+<rect x="229.4" y="114.0" width="12.6" height="13" fill="#72b7b2" rx="3"/>
+<rect x="242.2" y="82.0" width="2.0" height="13" fill="#c7e9c0" rx="3"/>
+<rect x="242.5" y="98.0" width="2.0" height="13" fill="#74c476" rx="3"/>
+<rect x="210.0" y="82.0" width="33.1" height="13" fill="#4c78a8" rx="3"/>
+<rect x="243.1" y="206.0" width="60.7" height="13" fill="#b279a2" rx="3"/>
+<rect x="243.7" y="174.0" width="60.3" height="13" fill="#f58518" rx="3"/>
+<rect x="305.4" y="190.0" width="79.4" height="13" fill="#e45756" rx="3"/>
+<text x="309.4" y="200.0" class="tiny">c4 decode</text>
+<rect x="384.9" y="266.0" width="2.0" height="13" fill="#bae4b3" rx="3"/>
+<rect x="385.3" y="282.0" width="2.0" height="13" fill="#8cd17d" rx="3"/>
+<rect x="305.2" y="206.0" width="80.7" height="13" fill="#ff9da6" rx="3"/>
+<text x="309.2" y="216.0" class="tiny">c4 llm_decode_loop</text>
+<rect x="210.0" y="298.0" width="175.9" height="13" fill="#a1d99b" rx="3"/>
+<text x="214.0" y="308.0" class="tiny">c-1 wait_data</text>
+<rect x="386.8" y="98.0" width="193.2" height="13" fill="#77aadd" rx="3"/>
+<text x="390.8" y="108.0" class="tiny">c5 encode</text>
+<rect x="580.2" y="114.0" width="14.7" height="13" fill="#72b7b2" rx="3"/>
+<rect x="595.6" y="82.0" width="2.0" height="13" fill="#c7e9c0" rx="3"/>
+<rect x="596.7" y="98.0" width="2.0" height="13" fill="#74c476" rx="3"/>
+<rect x="386.6" y="82.0" width="210.4" height="13" fill="#4c78a8" rx="3"/>
+<text x="390.6" y="92.0" class="tiny">c5 stream_prefill</text>
+<rect x="597.2" y="206.0" width="64.3" height="13" fill="#b279a2" rx="3"/>
+<text x="601.2" y="216.0" class="tiny">c5 prefill</text>
+<rect x="610.4" y="174.0" width="51.4" height="13" fill="#f58518" rx="3"/>
+<rect x="663.0" y="190.0" width="91.8" height="13" fill="#e45756" rx="3"/>
+<text x="667.0" y="200.0" class="tiny">c5 decode</text>
+<rect x="755.0" y="266.0" width="2.0" height="13" fill="#bae4b3" rx="3"/>
+<rect x="755.4" y="282.0" width="2.0" height="13" fill="#8cd17d" rx="3"/>
+<rect x="662.9" y="206.0" width="92.8" height="13" fill="#ff9da6" rx="3"/>
+<text x="666.9" y="216.0" class="tiny">c5 llm_decode_loop</text>
+<rect x="861.7" y="374.0" width="2.0" height="13" fill="#9ecae9" rx="3"/>
+<rect x="388.6" y="266.0" width="473.9" height="13" fill="#54a24b" rx="3"/>
+<text x="392.6" y="276.0" class="tiny">c4 infer</text>
+<rect x="862.7" y="298.0" width="2.0" height="13" fill="#a1d99b" rx="3"/>
+<rect x="210.0" y="390.0" width="653.5" height="13" fill="#c6dbef" rx="3"/>
+<text x="214.0" y="400.0" class="tiny">c-1 wait_data</text>
+<rect x="953.9" y="114.0" width="13.3" height="13" fill="#72b7b2" rx="3"/>
+<rect x="967.4" y="82.0" width="2.0" height="13" fill="#c7e9c0" rx="3"/>
+<rect x="967.7" y="98.0" width="2.0" height="13" fill="#74c476" rx="3"/>
+<rect x="756.4" y="82.0" width="212.0" height="13" fill="#4c78a8" rx="3"/>
+<text x="760.4" y="92.0" class="tiny">c6 stream_prefill</text>
+<rect x="863.8" y="358.0" width="164.0" height="13" fill="#3182bd" rx="3"/>
+<text x="867.8" y="368.0" class="tiny">c4 infer</text>
+<rect x="1028.0" y="374.0" width="2.0" height="13" fill="#9e9ac8" rx="3"/>
+<rect x="968.5" y="206.0" width="64.1" height="13" fill="#b279a2" rx="3"/>
+<text x="972.5" y="216.0" class="tiny">c6 prefill</text>
+<rect x="969.0" y="174.0" width="63.9" height="13" fill="#f58518" rx="3"/>
+<text x="973.0" y="184.0" class="tiny">c6 llm_prefill_done</text>
+<rect x="1034.3" y="190.0" width="75.7" height="13" fill="#e45756" rx="3"/>
+<text x="1038.3" y="200.0" class="tiny">c6 decode</text>
+<rect x="1034.1" y="206.0" width="75.9" height="13" fill="#ff9da6" rx="3"/>
+<text x="1038.1" y="216.0" class="tiny">c6 llm_decode_loop</text>
+<rect x="1028.7" y="390.0" width="81.3" height="13" fill="#c6dbef" rx="3"/>
+<text x="1032.7" y="400.0" class="tiny">c-1 wait_data</text>
+<rect x="864.7" y="266.0" width="245.3" height="13" fill="#54a24b" rx="3"/>
+<text x="868.7" y="276.0" class="tiny">c5 infer</text>
+</svg>

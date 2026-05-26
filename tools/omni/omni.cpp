@@ -273,6 +273,7 @@ struct LLMOut {
     // 此状态随数据一起传递，避免全局状态 current_turn_ended 的时序问题
     // 只有当 LLM 检测到 TURN_EOS/TTS_EOS/EOS 时才设置为 true
     bool is_end_of_turn = false;
+    int perf_chunk_index = -1;  // 性能日志归属的输入 chunk，随 TTS 队列传递
 };
 
  struct TTSThreadInfo{
@@ -4684,7 +4685,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             const int kv_prefill_start_n_past = ctx_omni->n_past;
             auto kv_prefill_t0 = std::chrono::steady_clock::now();
             std::string kv_prefill_detail = "items=" + std::to_string(llm_embeds.size());
-            omni_perf_mark(ctx_omni, "llm.kv_prefill", "start", perf_chunk_index, -1.0, kv_prefill_detail.c_str());
+            omni_perf_mark(ctx_omni, "llm.prefill", "start", perf_chunk_index, -1.0, kv_prefill_detail.c_str());
 
             // 🔧 [重构] 逐个处理嵌入数据，正确添加特殊标记
             // 遍历所有嵌入数据
@@ -4782,7 +4783,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             {
                 const double kv_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - kv_prefill_t0).count();
                 std::string detail = kv_prefill_detail + ",n_past_delta=" + std::to_string(ctx_omni->n_past - kv_prefill_start_n_past);
-                omni_perf_mark(ctx_omni, "llm.kv_prefill", "end", perf_chunk_index, kv_prefill_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "llm.prefill", "end", perf_chunk_index, kv_prefill_ms, detail.c_str());
             }
             
             // 🔧 [诊断] 打印 prefill 结束后的 n_past
@@ -5332,14 +5333,14 @@ static bool generate_audio_tokens_local(
     int chunk_idx,
     std::vector<int32_t>& output_audio_tokens,
     bool is_end_of_turn = false,  // 🔧 [与 Python 对齐] 是否是轮次结束
-    const std::string& output_dir = ""
+    const std::string& output_dir = "",
+    int perf_chunk_index = -1
 ) {
     print_with_timestamp("TTS Local: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d, emb_size=%zu)\n", 
                          chunk_idx, n_tokens, tts_n_embd, merged_embeddings.size());
-    std::string perf_detail = "tts_chunk=" + std::to_string(chunk_idx) +
-                              ",text_tokens=" + std::to_string(n_tokens) +
-                              ",is_end_of_turn=" + std::to_string(is_end_of_turn ? 1 : 0);
-    OmniPerfScope perf_scope(ctx_omni, "tts.llm_to_audio_tokens", ctx_omni ? ctx_omni->perf_current_chunk_index.load() : -1, perf_detail);
+    if (perf_chunk_index < 0 && ctx_omni) {
+        perf_chunk_index = ctx_omni->perf_current_chunk_index.load();
+    }
     
     // 🔧 [安全检查] 验证输入参数
     // 🔧 [修复尾音问题] 当 is_end_of_turn=true 时，允许 n_tokens=0
@@ -5588,12 +5589,19 @@ static bool generate_audio_tokens_local(
             t2w_out->is_final = false;
             t2w_out->is_chunk_end = false;  // 🔧 中间推送，不是 chunk 结束
             t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+            t2w_out->perf_chunk_index = perf_chunk_index;
             
+            auto enqueue_t0 = std::chrono::steady_clock::now();
+            std::string enqueue_detail = "tokens=" + std::to_string(t2w_out->audio_tokens.size()) +
+                                         ",is_final=0,is_chunk_end=0";
+            omni_perf_mark(ctx_omni, "queue.t2w.enqueue", "start", perf_chunk_index, -1.0, enqueue_detail.c_str());
             {
                 std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                 ctx_omni->t2w_thread_info->queue.push(t2w_out);
             }
             ctx_omni->t2w_thread_info->cv.notify_one();
+            double enqueue_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - enqueue_t0).count();
+            omni_perf_mark(ctx_omni, "queue.t2w.enqueue", "end", perf_chunk_index, enqueue_ms, enqueue_detail.c_str());
             stream_buffer.clear();
         }
         
@@ -5617,12 +5625,20 @@ static bool generate_audio_tokens_local(
         t2w_out->is_final = is_end_of_turn;
         t2w_out->is_chunk_end = !is_end_of_turn;  // 非 turn 结束时才用 is_chunk_end
         t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+        t2w_out->perf_chunk_index = perf_chunk_index;
         
+        auto enqueue_t0 = std::chrono::steady_clock::now();
+        std::string enqueue_detail = "tokens=" + std::to_string(t2w_out->audio_tokens.size()) +
+                                     ",is_final=" + std::to_string(t2w_out->is_final ? 1 : 0) +
+                                     ",is_chunk_end=" + std::to_string(t2w_out->is_chunk_end ? 1 : 0);
+        omni_perf_mark(ctx_omni, "queue.t2w.enqueue", "start", perf_chunk_index, -1.0, enqueue_detail.c_str());
         {
             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
             ctx_omni->t2w_thread_info->queue.push(t2w_out);
         }
         ctx_omni->t2w_thread_info->cv.notify_one();
+        double enqueue_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - enqueue_t0).count();
+        omni_perf_mark(ctx_omni, "queue.t2w.enqueue", "end", perf_chunk_index, enqueue_ms, enqueue_detail.c_str());
     }
     
     // Cleanup sampler
@@ -5982,14 +5998,19 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
         
         // 🔧 [修复双工缺字问题] 从 LLMOut 获取 is_end_of_turn 状态
         bool accumulated_is_end_of_turn = false;
+        int current_perf_chunk_index = -1;
             
         // Wait for queue
         if (!llm_finish || (llm_finish && llm_text.empty())) {
             std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
             auto& queue = ctx_omni->tts_thread_info->queue;
+            auto wait_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "queue.tts.wait_data", "start", -1, -1.0, nullptr);
             ctx_omni->tts_thread_info->cv.wait(lock, [&] { 
                 return !queue.empty() || !tts_thread_running || ctx_omni->break_event.load(); 
             });
+            double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
+            omni_perf_mark(ctx_omni, "queue.tts.wait_data", "end", -1, wait_ms, nullptr);
             
             if (ctx_omni->break_event.load()) {
                 lock.unlock();
@@ -6005,6 +6026,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             current_chunk_hidden_states.clear();
             current_chunk_n_embd = 0;
             accumulated_is_end_of_turn = false;
+            current_perf_chunk_index = -1;
             
             // 累积所有队列中的数据
             while (!queue.empty()) {
@@ -6012,6 +6034,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 llm_finish |= llm_out->llm_finish;
                 bool item_is_eot = llm_out->is_end_of_turn;
                 accumulated_is_end_of_turn |= item_is_eot;
+                if (current_perf_chunk_index < 0 && llm_out->perf_chunk_index >= 0) {
+                    current_perf_chunk_index = llm_out->perf_chunk_index;
+                }
                 
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
@@ -6080,6 +6105,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->is_final = false;
                         t2w_out->is_chunk_end = true;
                         t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->perf_chunk_index = current_perf_chunk_index;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                             ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6147,6 +6173,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     t2w_out->is_final = false;
                     t2w_out->is_chunk_end = true;
                     t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                    t2w_out->perf_chunk_index = current_perf_chunk_index;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                         ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6167,6 +6194,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     t2w_out->is_final = true;
                     t2w_out->is_chunk_end = false;
                     t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                    t2w_out->perf_chunk_index = current_perf_chunk_index;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                         ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6215,21 +6243,26 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 continue;
             }
             
-            // Filter special tokens
-            int n_tokens_orig = (int)(current_chunk_hidden_states.size() / current_chunk_n_embd);
-            std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
-            std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
-            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
-            int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
-            
-            if (n_tokens_filtered <= 0) {
-                continue;
-            }
-            
-            // Compute merged embeddings
-            const int tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
-            std::vector<float> merged_embeddings;
-            bool merged_success = false;
+            {
+                std::string tts_infer_detail = "tts_chunk=" + std::to_string(current_chunk_idx) +
+                                               ",llm_tokens=" + std::to_string(current_chunk_token_ids.size()) +
+                                               ",is_end_of_turn=" + std::to_string(accumulated_is_end_of_turn ? 1 : 0);
+                OmniPerfScope tts_infer_scope(ctx_omni, "tts.infer", current_perf_chunk_index, tts_infer_detail);
+
+                // Filter special tokens
+                std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
+                std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
+                filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
+                int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
+
+                if (n_tokens_filtered <= 0) {
+                    continue;
+                }
+
+                // Compute merged embeddings
+                const int tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
+                std::vector<float> merged_embeddings;
+                bool merged_success = false;
             
             if (ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
                 // Step 1: emb_text
@@ -6361,24 +6394,26 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             bool should_call_tts = (merged_success && !merged_embeddings.empty()) || 
                                    (accumulated_is_end_of_turn && ctx_omni->duplex_mode);
             
-            if (should_call_tts) {
-                std::vector<int32_t> audio_tokens_out;
-                bool is_end_of_turn = accumulated_is_end_of_turn;
-                
-                if (merged_embeddings.empty() && is_end_of_turn) {
-                    print_with_timestamp("TTS Duplex: is_end_of_turn=true with empty embeddings, calling TTS to flush\n");
-                    n_tokens_filtered = 0;
-                }
-                
-                bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, merged_embeddings,
-                                                n_tokens_filtered, tts_n_embd, current_chunk_idx,
-                                                audio_tokens_out, is_end_of_turn, tts_wav_output_dir);
-                
-                if (tts_gen_success) {
-                    all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
-                    
-                    if (is_end_of_turn && ctx_omni->duplex_mode) {
-                        turn_eos_flushed = true;
+                if (should_call_tts) {
+                    std::vector<int32_t> audio_tokens_out;
+                    bool is_end_of_turn = accumulated_is_end_of_turn;
+
+                    if (merged_embeddings.empty() && is_end_of_turn) {
+                        print_with_timestamp("TTS Duplex: is_end_of_turn=true with empty embeddings, calling TTS to flush\n");
+                        n_tokens_filtered = 0;
+                    }
+
+                    bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, merged_embeddings,
+                                                    n_tokens_filtered, tts_n_embd, current_chunk_idx,
+                                                    audio_tokens_out, is_end_of_turn, tts_wav_output_dir,
+                                                    current_perf_chunk_index);
+
+                    if (tts_gen_success) {
+                        all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
+
+                        if (is_end_of_turn && ctx_omni->duplex_mode) {
+                            turn_eos_flushed = true;
+                        }
                     }
                 }
             }
@@ -6404,6 +6439,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->is_final = false;
                         t2w_out->is_chunk_end = true;
                         t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->perf_chunk_index = current_perf_chunk_index;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                             ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6419,6 +6455,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->audio_tokens.clear();
                         t2w_out->is_final = true;
                         t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->perf_chunk_index = current_perf_chunk_index;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                             ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6453,10 +6490,14 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 std::vector<int32_t> audio_tokens_out;
                 int n_tokens_for_tts = 0;
                 int current_chunk_idx = chunk_idx;
+                std::string tts_infer_detail = "tts_chunk=" + std::to_string(current_chunk_idx) +
+                                               ",llm_tokens=0,is_end_of_turn=1,flush_only=1";
+                OmniPerfScope tts_infer_scope(ctx_omni, "tts.infer", current_perf_chunk_index, tts_infer_detail);
                 
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, empty_embeddings,
                                                 n_tokens_for_tts, tts_n_embd, current_chunk_idx,
-                                                audio_tokens_out, true, tts_wav_output_dir);
+                                                audio_tokens_out, true, tts_wav_output_dir,
+                                                current_perf_chunk_index);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -6467,6 +6508,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->is_final = true;
                         t2w_out->is_chunk_end = false;
                         t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->perf_chunk_index = current_perf_chunk_index;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                             ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -8499,7 +8541,11 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         }
         
         std::unique_lock<std::mutex> lock(mtx);
+        auto wait_t0 = std::chrono::steady_clock::now();
+        omni_perf_mark(ctx_omni, "queue.t2w.wait_data", "start", -1, -1.0, "backend=python");
         cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running; });
+        double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
+        omni_perf_mark(ctx_omni, "queue.t2w.wait_data", "end", -1, wait_ms, "backend=python");
         
         if (!t2w_thread_running && queue.empty()) {
             break;
@@ -8515,6 +8561,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         bool is_final = false;
         bool is_chunk_end = false;
         int received_round_idx = -1;  // 🔧 从队列中获取的 round_idx
+        int received_perf_chunk_index = -1;
         
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
@@ -8525,6 +8572,9 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             // 🔧 使用最新的 round_idx（最后一个有效的值）
             if (t2w_out->round_idx >= 0) {
                 received_round_idx = t2w_out->round_idx;
+            }
+            if (received_perf_chunk_index < 0 && t2w_out->perf_chunk_index >= 0) {
+                received_perf_chunk_index = t2w_out->perf_chunk_index;
             }
             delete t2w_out;
         }
@@ -8590,14 +8640,14 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             auto t2w_perf_t0 = std::chrono::steady_clock::now();
             std::string t2w_detail = "backend=python,window_tokens=" + std::to_string(window.size()) +
                                      ",is_last=" + std::to_string(is_last_window ? 1 : 0);
-            omni_perf_mark(ctx_omni, "t2w.tokens_to_wav", "start", ctx_omni->perf_current_chunk_index.load(), -1.0, t2w_detail.c_str());
+            omni_perf_mark(ctx_omni, "t2w.infer", "start", received_perf_chunk_index, -1.0, t2w_detail.c_str());
             bool t2w_ok = process_python_t2w_tokens(ctx_omni, window, is_last_window, wav_path, inference_time_ms, audio_duration);
             {
                 double t2w_perf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2w_perf_t0).count();
                 std::string detail = t2w_detail + ",ok=" + std::to_string(t2w_ok ? 1 : 0) +
                                      ",audio_s=" + std::to_string(audio_duration) +
                                      ",infer_ms=" + std::to_string(inference_time_ms);
-                omni_perf_mark(ctx_omni, "t2w.tokens_to_wav", "end", ctx_omni->perf_current_chunk_index.load(), t2w_perf_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "t2w.infer", "end", received_perf_chunk_index, t2w_perf_ms, detail.c_str());
             }
             if (t2w_ok) {
                 if (audio_duration > 0) {
@@ -8788,7 +8838,11 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         std::unique_lock<std::mutex> lock(mtx);
         
         // Wait for queue to have data or thread to stop
+        auto wait_t0 = std::chrono::steady_clock::now();
+        omni_perf_mark(ctx_omni, "queue.t2w.wait_data", "start", -1, -1.0, "backend=cpp");
         cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load(); });
+        double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_t0).count();
+        omni_perf_mark(ctx_omni, "queue.t2w.wait_data", "end", -1, wait_ms, "backend=cpp");
         
         if (!t2w_thread_running && queue.empty()) {
             break;
@@ -8805,6 +8859,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         bool is_final = false;
         bool is_chunk_end = false;  // 标记 TTS chunk 结束
         int received_round_idx = -1;  // 🔧 保存传入的 round_idx
+        int received_perf_chunk_index = -1;
         
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
@@ -8816,6 +8871,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             // 🔧 保存最后一个有效的 round_idx（优先使用非负值）
             if (t2w_out->round_idx >= 0) {
                 received_round_idx = t2w_out->round_idx;
+            }
+            if (received_perf_chunk_index < 0 && t2w_out->perf_chunk_index >= 0) {
+                received_perf_chunk_index = t2w_out->perf_chunk_index;
             }
             delete t2w_out;
         }
@@ -8908,17 +8966,21 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             std::vector<float> chunk_wav;
             std::string t2w_detail = "backend=cpp,window_tokens=" + std::to_string(window.size()) +
                                      ",is_last=" + std::to_string(is_last_window ? 1 : 0);
-            omni_perf_mark(ctx_omni, "t2w.tokens_to_wav", "start", ctx_omni->perf_current_chunk_index.load(), -1.0, t2w_detail.c_str());
+            omni_perf_mark(ctx_omni, "t2w.infer", "start", received_perf_chunk_index, -1.0, t2w_detail.c_str());
             bool t2w_ok = ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav);
             if (t2w_ok) {
                 auto t2w_end = std::chrono::high_resolution_clock::now();
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 std::string detail = t2w_detail + ",ok=1,wav_samples=" + std::to_string(chunk_wav.size());
-                omni_perf_mark(ctx_omni, "t2w.tokens_to_wav", "end", ctx_omni->perf_current_chunk_index.load(), t2w_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "t2w.infer", "end", received_perf_chunk_index, t2w_ms, detail.c_str());
                 
                 if (!chunk_wav.empty()) {
                     // Write WAV file
                     std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+                    auto t2w_write_t0 = std::chrono::steady_clock::now();
+                    std::string write_detail = "backend=cpp,wav_samples=" + std::to_string(chunk_wav.size()) +
+                                               ",path=" + wav_path;
+                    omni_perf_mark(ctx_omni, "t2w.write", "start", received_perf_chunk_index, -1.0, write_detail.c_str());
                     
                     const int16_t num_channels = 1;
                     const int16_t bits_per_sample = 16;
@@ -8970,12 +9032,14 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                                             ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
                         wav_idx++;
                     }
+                    double t2w_write_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2w_write_t0).count();
+                    omni_perf_mark(ctx_omni, "t2w.write", "end", received_perf_chunk_index, t2w_write_ms, write_detail.c_str());
                 }
             } else {
                 auto t2w_end = std::chrono::high_resolution_clock::now();
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 std::string detail = t2w_detail + ",ok=0";
-                omni_perf_mark(ctx_omni, "t2w.tokens_to_wav", "end", ctx_omni->perf_current_chunk_index.load(), t2w_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "t2w.infer", "end", received_perf_chunk_index, t2w_ms, detail.c_str());
                 LOG_ERR("T2W线程: feed_window 失败\n");
             }
             
@@ -9083,7 +9147,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         ctx_omni->perf_current_chunk_index.store(index);
     }
     std::string prefill_detail = "aud=" + aud_fname + ",img=" + (img_fname.empty() ? "none" : img_fname);
-    OmniPerfScope perf_scope(ctx_omni, "stream_prefill", index, prefill_detail);
+    OmniPerfScope perf_scope(ctx_omni, "api.stream_prefill", index, prefill_detail);
     
     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
     // 同一轮内的后续 prefill (index >= 1) 不需要等待
@@ -9194,21 +9258,21 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
             auto audio_encode_t0 = std::chrono::steady_clock::now();
-            omni_perf_mark(ctx_omni, "session.ref_audio_encode", "start", index, -1.0, aud_fname.c_str());
+            omni_perf_mark(ctx_omni, "session.init.ref_audio_encode", "start", index, -1.0, aud_fname.c_str());
             auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
             {
                 double encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audio_encode_t0).count();
                 std::string detail = "n_pos=" + std::to_string(audio_embeds ? audio_embeds->n_pos : 0);
-                omni_perf_mark(ctx_omni, "session.ref_audio_encode", "end", index, encode_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_encode", "end", index, encode_ms, detail.c_str());
             }
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
                 auto ref_prefill_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "session.ref_audio_kv_prefill", "start", index, -1.0, nullptr);
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_prefill", "start", index, -1.0, nullptr);
                 prefill_with_emb(ctx_omni, ctx_omni->params, audio_embeds->embed, audio_embeds->n_pos, 
                                 ctx_omni->params->n_batch, &ctx_omni->n_past);
                 double ref_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ref_prefill_t0).count();
                 std::string detail = "n_pos=" + std::to_string(audio_embeds->n_pos);
-                omni_perf_mark(ctx_omni, "session.ref_audio_kv_prefill", "end", index, ref_prefill_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_prefill", "end", index, ref_prefill_ms, detail.c_str());
                 omni_embed_free(audio_embeds);
             } else {
             }
@@ -9233,22 +9297,22 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
             auto ref_encode_t0 = std::chrono::steady_clock::now();
-            omni_perf_mark(ctx_omni, "session.ref_audio_encode", "start", index, -1.0, system_ref_audio.c_str());
+            omni_perf_mark(ctx_omni, "session.init.ref_audio_encode", "start", index, -1.0, system_ref_audio.c_str());
             auto * ref_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
             {
                 double encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ref_encode_t0).count();
                 std::string detail = "n_pos=" + std::to_string(ref_audio_embeds ? ref_audio_embeds->n_pos : 0);
-                omni_perf_mark(ctx_omni, "session.ref_audio_encode", "end", index, encode_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_encode", "end", index, encode_ms, detail.c_str());
             }
             if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
                 print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
                 auto ref_prefill_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "session.ref_audio_kv_prefill", "start", index, -1.0, nullptr);
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_prefill", "start", index, -1.0, nullptr);
                 prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos, 
                                 ctx_omni->params->n_batch, &ctx_omni->n_past);
                 double ref_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ref_prefill_t0).count();
                 std::string detail = "n_pos=" + std::to_string(ref_audio_embeds->n_pos);
-                omni_perf_mark(ctx_omni, "session.ref_audio_kv_prefill", "end", index, ref_prefill_ms, detail.c_str());
+                omni_perf_mark(ctx_omni, "session.init.ref_audio_prefill", "end", index, ref_prefill_ms, detail.c_str());
                 omni_embed_free(ref_audio_embeds);
             } else {
                 print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
@@ -9325,18 +9389,18 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 }
                 std::vector<std::vector<float>> vision_chunks;
                 auto vision_encode_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "prefill.vision_encode", "start", index, -1.0, img_fname.c_str());
+                omni_perf_mark(ctx_omni, "vision.encode", "start", index, -1.0, img_fname.c_str());
                 if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
                         ctx_omni->params->cpuparams.n_threads, img_fname, vision_chunks)) {
                     double vision_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vision_encode_t0).count();
-                    omni_perf_mark(ctx_omni, "prefill.vision_encode", "end", index, vision_encode_ms, "failed");
+                    omni_perf_mark(ctx_omni, "vision.encode", "end", index, vision_encode_ms, "failed");
                     LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
                     return false;
                 }
                 {
                     double vision_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vision_encode_t0).count();
                     std::string detail = "chunks=" + std::to_string(vision_chunks.size());
-                    omni_perf_mark(ctx_omni, "prefill.vision_encode", "end", index, vision_encode_ms, detail.c_str());
+                    omni_perf_mark(ctx_omni, "vision.encode", "end", index, vision_encode_ms, detail.c_str());
                 }
                 
                 int n_chunks = (int)vision_chunks.size();
@@ -9344,7 +9408,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 bool has_slices = (n_chunks > 1);
                 
                 auto vision_prefill_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "prefill.vision_kv_prefill", "start", index, -1.0, nullptr);
+                omni_perf_mark(ctx_omni, "llm.prefill", "start", index, -1.0, "mode=sync,modality=vision");
                 std::string prefix = "<unit>";
                 eval_string(ctx_omni, ctx_omni->params, prefix.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                 
@@ -9365,19 +9429,20 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 {
                     double vision_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vision_prefill_t0).count();
                     std::string detail = "chunks=" + std::to_string(n_chunks) + ",tokens_per_chunk=" + std::to_string(tokens_per_chunk);
-                    omni_perf_mark(ctx_omni, "prefill.vision_kv_prefill", "end", index, vision_prefill_ms, detail.c_str());
+                    detail = "mode=sync,modality=vision," + detail;
+                    omni_perf_mark(ctx_omni, "llm.prefill", "end", index, vision_prefill_ms, detail.c_str());
                 }
                 LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
             }
             if (aud_fname.length() > 0) {
                 print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
                 auto audio_encode_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "prefill.audio_encode", "start", index, -1.0, aud_fname.c_str());
+                omni_perf_mark(ctx_omni, "audio.encode", "start", index, -1.0, aud_fname.c_str());
                 auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
                 {
                     double audio_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audio_encode_t0).count();
                     std::string detail = "n_pos=" + std::to_string(embeds ? embeds->n_pos : 0);
-                    omni_perf_mark(ctx_omni, "prefill.audio_encode", "end", index, audio_encode_ms, detail.c_str());
+                    omni_perf_mark(ctx_omni, "audio.encode", "end", index, audio_encode_ms, detail.c_str());
                 }
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频
@@ -9385,13 +9450,14 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, embeds->n_pos);
                     // 🔧 添加音频标记，与 index=0 保持一致
                     auto audio_prefill_t0 = std::chrono::steady_clock::now();
-                    omni_perf_mark(ctx_omni, "prefill.audio_kv_prefill", "start", index, -1.0, nullptr);
+                    omni_perf_mark(ctx_omni, "llm.prefill", "start", index, -1.0, "mode=sync,modality=audio");
                     eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                     prefill_with_emb(ctx_omni, ctx_omni->params, embeds->embed, embeds->n_pos, ctx_omni->params->n_batch, &ctx_omni->n_past);
                     eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                     double audio_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audio_prefill_t0).count();
                     std::string detail = "n_pos=" + std::to_string(embeds->n_pos);
-                    omni_perf_mark(ctx_omni, "prefill.audio_kv_prefill", "end", index, audio_prefill_ms, detail.c_str());
+                    detail = "mode=sync,modality=audio," + detail;
+                    omni_perf_mark(ctx_omni, "llm.prefill", "end", index, audio_prefill_ms, detail.c_str());
                     omni_embed_free(embeds);
                 } else {
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
@@ -9415,11 +9481,11 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                         LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
                     }
                     auto vision_encode_t0 = std::chrono::steady_clock::now();
-                    omni_perf_mark(ctx_omni, "prefill.vision_encode", "start", index, -1.0, img_fname.c_str());
+                    omni_perf_mark(ctx_omni, "vision.encode", "start", index, -1.0, img_fname.c_str());
                     if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
                             ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed)) {
                         double vision_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vision_encode_t0).count();
-                        omni_perf_mark(ctx_omni, "prefill.vision_encode", "end", index, vision_encode_ms, "failed");
+                        omni_perf_mark(ctx_omni, "vision.encode", "end", index, vision_encode_ms, "failed");
                         LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
                         delete omni_embeds;
                         return false;
@@ -9427,7 +9493,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     {
                         double vision_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - vision_encode_t0).count();
                         std::string detail = "chunks=" + std::to_string(omni_embeds->vision_embed.size());
-                        omni_perf_mark(ctx_omni, "prefill.vision_encode", "end", index, vision_encode_ms, detail.c_str());
+                        omni_perf_mark(ctx_omni, "vision.encode", "end", index, vision_encode_ms, detail.c_str());
                     }
                     LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
                 }
@@ -9437,12 +9503,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             if (aud_fname.length() > 0) {
                 LOG_INF("%s: aud_fname:%s\n", __func__, aud_fname.c_str());
                 auto audio_encode_t0 = std::chrono::steady_clock::now();
-                omni_perf_mark(ctx_omni, "prefill.audio_encode", "start", index, -1.0, aud_fname.c_str());
+                omni_perf_mark(ctx_omni, "audio.encode", "start", index, -1.0, aud_fname.c_str());
                 auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
                 {
                     double audio_encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - audio_encode_t0).count();
                     std::string detail = "n_pos=" + std::to_string(audio_embeds ? audio_embeds->n_pos : 0);
-                    omni_perf_mark(ctx_omni, "prefill.audio_encode", "end", index, audio_encode_ms, detail.c_str());
+                    omni_perf_mark(ctx_omni, "audio.encode", "end", index, audio_encode_ms, detail.c_str());
                 }
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频（保持 audio_embed 为空）
@@ -9462,10 +9528,16 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             
             std::string enqueue_detail = "audio_values=" + std::to_string(omni_embeds->audio_embed.size()) +
                                          ",vision_chunks=" + std::to_string(omni_embeds->vision_embed.size());
-            auto enqueue_t0 = std::chrono::steady_clock::now();
-            omni_perf_mark(ctx_omni, "prefill.enqueue_llm", "start", index, -1.0, nullptr);
+            auto wait_space_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "queue.llm.wait_space", "start", index, -1.0, enqueue_detail.c_str());
             std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
             ctx_omni->llm_thread_info->cv.wait(lock, [&] { return ctx_omni->llm_thread_info->queue.size() < ctx_omni->llm_thread_info->MAX_QUEUE_SIZE; });
+            {
+                double wait_space_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_space_t0).count();
+                omni_perf_mark(ctx_omni, "queue.llm.wait_space", "end", index, wait_space_ms, enqueue_detail.c_str());
+            }
+            auto enqueue_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "queue.llm.enqueue", "start", index, -1.0, enqueue_detail.c_str());
             ctx_omni->llm_thread_info->queue.push(omni_embeds);
 
             //notify the llm
@@ -9473,7 +9545,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             ctx_omni->llm_thread_info->cv.notify_all();
             {
                 double enqueue_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - enqueue_t0).count();
-                omni_perf_mark(ctx_omni, "prefill.enqueue_llm", "end", index, enqueue_ms, enqueue_detail.c_str());
+                omni_perf_mark(ctx_omni, "queue.llm.enqueue", "end", index, enqueue_ms, enqueue_detail.c_str());
             }
         }
     }
@@ -9485,7 +9557,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
 
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     const int perf_chunk_index = ctx_omni ? ctx_omni->perf_current_chunk_index.load() : -1;
-    OmniPerfScope perf_scope(ctx_omni, "stream_decode", perf_chunk_index, "debug_dir=" + debug_dir);
+    OmniPerfScope perf_scope(ctx_omni, "api.stream_decode", perf_chunk_index, "debug_dir=" + debug_dir);
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
     // 如果需要归档，可以在新 session 开始时（omni_init）手动调用
     // move_old_output_to_archive();
@@ -9583,12 +9655,12 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         ctx_omni->llm_thread_info->cv.notify_all();
         print_with_timestamp("wait prefill done\n");
         auto wait_prefill_t0 = std::chrono::steady_clock::now();
-        omni_perf_mark(ctx_omni, "decode.wait_llm_prefill", "start", perf_chunk_index, -1.0, nullptr);
+        omni_perf_mark(ctx_omni, "wait.llm_prefill_done", "start", perf_chunk_index, -1.0, nullptr);
         std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
         g_decode_cv.wait(lock, []{ return prefill_done; });
         prefill_done = false;
         double wait_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_prefill_t0).count();
-        omni_perf_mark(ctx_omni, "decode.wait_llm_prefill", "end", perf_chunk_index, wait_prefill_ms, nullptr);
+        omni_perf_mark(ctx_omni, "wait.llm_prefill_done", "end", perf_chunk_index, wait_prefill_ms, nullptr);
     }
 
     // 🔧 [unit 记账] 现在 prefill 已经写完 KV、unit_history 里也已经
@@ -9641,7 +9713,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
         if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
             auto force_listen_t0 = std::chrono::steady_clock::now();
-            omni_perf_mark(ctx_omni, "decode.force_listen", "start", perf_chunk_index, -1.0, nullptr);
+            omni_perf_mark(ctx_omni, "control.force_listen", "start", perf_chunk_index, -1.0, nullptr);
             ctx_omni->force_listen_used++;
             ctx_omni->slide_last_was_listen = true;
             ctx_omni->ended_with_listen = true;
@@ -9661,7 +9733,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             double force_listen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - force_listen_t0).count();
             std::string detail = "used=" + std::to_string(ctx_omni->force_listen_used) +
                                  ",count=" + std::to_string(ctx_omni->force_listen_count);
-            omni_perf_mark(ctx_omni, "decode.force_listen", "end", perf_chunk_index, force_listen_ms, detail.c_str());
+            omni_perf_mark(ctx_omni, "control.force_listen", "end", perf_chunk_index, force_listen_ms, detail.c_str());
             return true;
         }
     } else if (ctx_omni->use_tts) {
@@ -9714,7 +9786,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     int perf_decode_total_tokens = 0;
     int perf_decode_valid_tts_tokens = 0;
     auto llm_sample_t0 = std::chrono::steady_clock::now();
-    omni_perf_mark(ctx_omni, "decode.llm_sample", "start", perf_chunk_index, -1.0, nullptr);
+    omni_perf_mark(ctx_omni, "api.llm_decode_loop", "start", perf_chunk_index, -1.0, nullptr);
     for (int il = 0; il < max_tgt_len; ) {
         // 🔧 [P0-打断检测] 外层循环也检测 break_event
         if (ctx_omni->break_event.load()) {
@@ -9747,6 +9819,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // - 单工模式: 无限制，LLM 生成直到 EOS
         int max_chunk_tokens = ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
         bool chunk_limit_reached = (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens);
+        const int llm_infer_start_n_past = ctx_omni->n_past;
+        auto llm_infer_t0 = std::chrono::steady_clock::now();
+        std::string llm_infer_start_detail = "step_size=" + std::to_string(step_size);
+        omni_perf_mark(ctx_omni, "llm.decode", "start", perf_chunk_index, -1.0, llm_infer_start_detail.c_str());
         {
             fflush(stdout);
             // 🔧 [重要] 循环直到收集到 step_size 个有效 token，而不是生成 step_size 个 token
@@ -9811,7 +9887,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     llm_first_token_logged = true;
                     double first_token_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - llm_sample_t0).count();
-                    omni_perf_mark(ctx_omni, "decode.first_token", "mark", perf_chunk_index, first_token_ms, nullptr);
+                    omni_perf_mark(ctx_omni, "llm.decode.first_token", "mark", perf_chunk_index, first_token_ms, nullptr);
                 }
                 if (tmp == nullptr) {
                     LOG_ERR("llama_loop returned nullptr!");
@@ -9940,6 +10016,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens, 
                        ctx_omni->params->n_batch, &ctx_omni->n_past);
         }
+        {
+            double llm_infer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - llm_infer_t0).count();
+            std::string detail = "tokens=" + std::to_string(total_tokens_generated) +
+                                 ",valid_tts_tokens=" + std::to_string(chunk_token_ids.size()) +
+                                 ",n_past_delta=" + std::to_string(ctx_omni->n_past - llm_infer_start_n_past);
+            omni_perf_mark(ctx_omni, "llm.decode", "end", perf_chunk_index, llm_infer_ms, detail.c_str());
+        }
         fflush(stdout);
         if (!response.empty()) {
             fflush(stdout);
@@ -10010,6 +10093,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // 🔧 [修复双工缺字问题] 传递 is_end_of_turn 状态
                 // 此状态随数据一起传递，确保 TTS 处理的是与当前 chunk 对应的状态
                 llm_out->is_end_of_turn = local_is_end_of_turn;
+                llm_out->perf_chunk_index = perf_chunk_index;
                 
                 // 🔧 [诊断日志] 打印 LLM 推送给 TTS 的数据
                 {
@@ -10030,16 +10114,22 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 
                 fflush(stdout);
                 fflush(stdout);
-                auto tts_enqueue_t0 = std::chrono::steady_clock::now();
                 std::string tts_enqueue_detail = "tokens=" + std::to_string(chunk_token_ids.size()) +
                                                  ",llm_finish=" + std::to_string(llm_finish ? 1 : 0) +
                                                  ",text_bytes=" + std::to_string(response.size());
-                omni_perf_mark(ctx_omni, "tts.enqueue_from_llm", "start", perf_chunk_index, -1.0, tts_enqueue_detail.c_str());
                 std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
                 fflush(stdout);
+                auto tts_wait_space_t0 = std::chrono::steady_clock::now();
+                omni_perf_mark(ctx_omni, "queue.tts.wait_space", "start", perf_chunk_index, -1.0, tts_enqueue_detail.c_str());
                 ctx_omni->tts_thread_info->cv.wait(lock, [&] { return ctx_omni->tts_thread_info->queue.size() < ctx_omni->tts_thread_info->MAX_QUEUE_SIZE; });
+                {
+                    double tts_wait_space_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tts_wait_space_t0).count();
+                    omni_perf_mark(ctx_omni, "queue.tts.wait_space", "end", perf_chunk_index, tts_wait_space_ms, tts_enqueue_detail.c_str());
+                }
                 fflush(stdout);
                 fflush(stdout);
+                auto tts_enqueue_t0 = std::chrono::steady_clock::now();
+                omni_perf_mark(ctx_omni, "queue.tts.enqueue", "start", perf_chunk_index, -1.0, tts_enqueue_detail.c_str());
                 // 🔧 [关键修复 - 与 Python 对齐] 在双工模式下，LLM 始终推送数据到 TTS 队列
                 // 因为双工模式下每个 chunk 都需要独立处理，不能因为上一个 chunk 完成（speek_done=true）就丢弃新数据
                 // Python 双工模型：每次 streaming_generate 调用都会独立处理 LLM 输出并生成 TTS
@@ -10061,7 +10151,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 fflush(stdout);
                 {
                     double tts_enqueue_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tts_enqueue_t0).count();
-                    omni_perf_mark(ctx_omni, "tts.enqueue_from_llm", "end", perf_chunk_index, tts_enqueue_ms, tts_enqueue_detail.c_str());
+                    omni_perf_mark(ctx_omni, "queue.tts.enqueue", "end", perf_chunk_index, tts_enqueue_ms, tts_enqueue_detail.c_str());
                 }
             }
             fflush(stdout);
@@ -10075,7 +10165,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         double llm_sample_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - llm_sample_t0).count();
         std::string detail = "tokens=" + std::to_string(perf_decode_total_tokens) +
                              ",valid_tts_tokens=" + std::to_string(perf_decode_valid_tts_tokens);
-        omni_perf_mark(ctx_omni, "decode.llm_sample", "end", perf_chunk_index, llm_sample_ms, detail.c_str());
+        omni_perf_mark(ctx_omni, "api.llm_decode_loop", "end", perf_chunk_index, llm_sample_ms, detail.c_str());
     }
     fflush(stdout);
     // 🔧 [P1-SSE响应] 推送轮次结束标记
