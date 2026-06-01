@@ -8,6 +8,7 @@ host without creating a conda environment.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import html
 import re
@@ -17,11 +18,24 @@ from pathlib import Path
 
 PERF_RE = re.compile(
     r"(?P<wall>\d{2}:\d{2}:\d{2}\.\d{3}) "
-    r"\[DUPLEX_PERF\] stage=(?P<stage>\S+) event=(?P<event>\S+) "
+    r"\[DUPLEX_PERF\] (?:seq=(?P<seq>\d+) )?stage=(?P<stage>\S+) event=(?P<event>\S+) "
     r"chunk=(?P<chunk>-?\d+) t_ms=(?P<t_ms>[-\d.]+) dur_ms=(?P<dur_ms>[-\d.]+) "
     r"rss_mb=(?P<rss_mb>[-\d.]+|NA) gpu_used_mb=(?P<gpu_used_mb>[-\d.]+|NA) "
     r"gpu_total_mb=(?P<gpu_total_mb>[-\d.]+|NA) n_past=(?P<n_past>-?\d+) "
     r'detail="(?P<detail>[^"]*)"'
+)
+GPU_SAMPLE_RE = re.compile(
+    r"(?P<wall>\d{2}:\d{2}:\d{2}\.\d{3}) "
+    r"\[DUPLEX_GPU\] sample_id=(?P<sample_id>\d+) t_ms=(?P<t_ms>[-\d.]+) "
+    r"device=(?P<device>\d+) sm_util_pct=(?P<sm_util_pct>[-\d.]+|NA) "
+    r"mem_util_pct=(?P<mem_util_pct>[-\d.]+|NA) gpu_used_mb=(?P<gpu_used_mb>[-\d.]+|NA) "
+    r"gpu_total_mb=(?P<gpu_total_mb>[-\d.]+|NA) power_w=(?P<power_w>[-\d.]+|NA) "
+    r"temp_c=(?P<temp_c>[-\d.]+|NA) graphics_clock_mhz=(?P<graphics_clock_mhz>[-\d.]+|NA) "
+    r"mem_clock_mhz=(?P<mem_clock_mhz>[-\d.]+|NA)"
+)
+GPU_STATUS_RE = re.compile(
+    r"(?P<wall>\d{2}:\d{2}:\d{2}\.\d{3}) "
+    r'\[DUPLEX_GPU\] event=(?P<event>\S+) reason="(?P<reason>[^"]*)"'
 )
 CHUNK_RE = re.compile(r"prefill:\s*([0-9.]+) s \| decode:\s*([0-9.]+) s \| total:\s*([0-9.]+) s \| n_past:\s*(\d+)")
 DECISION_RE = re.compile(r"决策:\s*<\|(speak|listen)\|>(?:\s*→\s*\"([^\"]*)\")?")
@@ -69,13 +83,29 @@ def parse_metric(value: str) -> float:
     return -1.0 if value == "NA" else float(value)
 
 
-def parse_log(path: Path):
+def parse_detail(detail: str):
+    result = {}
+    for part in detail.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        result[key.strip()] = value.strip()
+    return result
+
+
+def parse_log(path: Path, gpu_log_path=None):
     text = path.read_text(errors="replace")
+    gpu_text = ""
+    if gpu_log_path and gpu_log_path != path:
+        gpu_text = gpu_log_path.read_text(errors="replace")
+    combined_gpu_text = text + "\n" + gpu_text
+
     events = []
     for match in PERF_RE.finditer(text):
         group = match.groupdict()
         events.append({
             "wall": group["wall"],
+            "seq": int(group["seq"]) if group.get("seq") is not None else -1,
             "stage": group["stage"],
             "event": group["event"],
             "chunk": int(group["chunk"]),
@@ -86,6 +116,34 @@ def parse_log(path: Path):
             "gpu_total_mb": parse_metric(group["gpu_total_mb"]),
             "n_past": int(group["n_past"]),
             "detail": group["detail"],
+        })
+
+    gpu_samples = []
+    for match in GPU_SAMPLE_RE.finditer(combined_gpu_text):
+        group = match.groupdict()
+        gpu_samples.append({
+            "wall": group["wall"],
+            "sample_id": int(group["sample_id"]),
+            "t_ms": float(group["t_ms"]),
+            "device": int(group["device"]),
+            "sm_util_pct": parse_metric(group["sm_util_pct"]),
+            "mem_util_pct": parse_metric(group["mem_util_pct"]),
+            "gpu_used_mb": parse_metric(group["gpu_used_mb"]),
+            "gpu_total_mb": parse_metric(group["gpu_total_mb"]),
+            "power_w": parse_metric(group["power_w"]),
+            "temp_c": parse_metric(group["temp_c"]),
+            "graphics_clock_mhz": parse_metric(group["graphics_clock_mhz"]),
+            "mem_clock_mhz": parse_metric(group["mem_clock_mhz"]),
+        })
+    gpu_samples.sort(key=lambda row: (row["device"], row["t_ms"], row["sample_id"]))
+
+    gpu_statuses = []
+    for match in GPU_STATUS_RE.finditer(combined_gpu_text):
+        group = match.groupdict()
+        gpu_statuses.append({
+            "wall": group["wall"],
+            "event": group["event"],
+            "reason": group["reason"],
         })
 
     decisions = list(DECISION_RE.finditer(text))
@@ -102,7 +160,7 @@ def parse_log(path: Path):
             "decision": decision,
             "text": decision_text,
         })
-    return text, events, chunks
+    return text, events, chunks, gpu_samples, gpu_statuses
 
 
 def stage_stats(events):
@@ -120,6 +178,134 @@ def stage_stats(events):
             "p90": pctl(values, 0.90),
             "min": min(values),
             "max": max(values),
+        }
+    return stats
+
+
+def tts_token_rows(events):
+    rows = []
+    for event in sorted(events, key=lambda item: (item["t_ms"], item.get("seq", -1))):
+        if event["stage"] != "tts.infer" or event["event"] != "end":
+            continue
+        detail = parse_detail(event["detail"])
+        def to_int(key, default=0):
+            try:
+                return int(detail.get(key, default))
+            except ValueError:
+                return default
+        llm_tokens = to_int("llm_tokens")
+        filtered_llm_tokens = to_int("filtered_llm_tokens", llm_tokens)
+        condition_tokens = to_int("condition_tokens")
+        audio_tokens = to_int("audio_tokens_generated", -1)
+        rows.append({
+            "chunk": event["chunk"],
+            "tts_chunk": to_int("tts_chunk", event["chunk"]),
+            "dur_ms": event["dur_ms"],
+            "llm_tokens": llm_tokens,
+            "filtered_llm_tokens": filtered_llm_tokens,
+            "condition_tokens": condition_tokens,
+            "audio_tokens_generated": audio_tokens,
+            "is_end_of_turn": to_int("is_end_of_turn"),
+            "flush_only": to_int("flush_only"),
+            "audio_tokens_per_ms": audio_tokens / event["dur_ms"] if audio_tokens >= 0 and event["dur_ms"] > 0 else 0.0,
+            "ms_per_audio_token": event["dur_ms"] / audio_tokens if audio_tokens > 0 else 0.0,
+            "has_audio_token_detail": int(audio_tokens >= 0),
+        })
+    return rows
+
+
+def build_stage_intervals(events):
+    starts = defaultdict(list)
+    intervals = []
+    for event in sorted(events, key=lambda item: (item["t_ms"], item.get("seq", -1))):
+        key = (event["stage"], event["chunk"])
+        if event["event"] == "start":
+            starts[key].append(event)
+        elif event["event"] == "end" and event["dur_ms"] >= 0:
+            start = starts[key].pop(0) if starts[key] else None
+            begin = start["t_ms"] if start else event["t_ms"] - event["dur_ms"]
+            finish = event["t_ms"]
+            if finish >= begin:
+                intervals.append({
+                    "stage": event["stage"],
+                    "chunk": event["chunk"],
+                    "begin_ms": begin,
+                    "end_ms": finish,
+                    "duration_ms": finish - begin,
+                })
+    return intervals
+
+
+def nearest_sample(samples, times, target):
+    if not samples:
+        return None
+    idx = bisect.bisect_left(times, target)
+    candidates = []
+    if idx < len(samples):
+        candidates.append(samples[idx])
+    if idx > 0:
+        candidates.append(samples[idx - 1])
+    return min(candidates, key=lambda sample: abs(sample["t_ms"] - target)) if candidates else None
+
+
+def stage_gpu_stats(intervals, gpu_samples):
+    by_device = defaultdict(list)
+    for sample in gpu_samples:
+        by_device[sample["device"]].append(sample)
+    for samples in by_device.values():
+        samples.sort(key=lambda sample: sample["t_ms"])
+
+    grouped = defaultdict(lambda: {
+        "n_intervals": 0,
+        "n_samples": 0,
+        "total_ms": 0.0,
+        "estimated_samples": 0,
+        "sm": [],
+        "mem": [],
+        "power": [],
+    })
+
+    for interval in intervals:
+        for device, samples in by_device.items():
+            times = [sample["t_ms"] for sample in samples]
+            lo = bisect.bisect_left(times, interval["begin_ms"])
+            hi = bisect.bisect_right(times, interval["end_ms"])
+            selected = samples[lo:hi]
+            estimated = False
+            if not selected:
+                sample = nearest_sample(samples, times, (interval["begin_ms"] + interval["end_ms"]) / 2.0)
+                selected = [sample] if sample else []
+                estimated = bool(sample)
+
+            row = grouped[(interval["stage"], device)]
+            row["n_intervals"] += 1
+            row["total_ms"] += interval["duration_ms"]
+            if estimated:
+                row["estimated_samples"] += 1
+            row["n_samples"] += len(selected)
+            row["sm"].extend(sample["sm_util_pct"] for sample in selected if sample["sm_util_pct"] >= 0)
+            row["mem"].extend(sample["mem_util_pct"] for sample in selected if sample["mem_util_pct"] >= 0)
+            row["power"].extend(sample["power_w"] for sample in selected if sample["power_w"] >= 0)
+
+    stats = {}
+    for (stage, device), row in grouped.items():
+        avg_sm = avg(row["sm"])
+        stats[(stage, device)] = {
+            "stage": stage,
+            "device": device,
+            "n_intervals": row["n_intervals"],
+            "n_samples": row["n_samples"],
+            "total_ms": row["total_ms"],
+            "avg_sm_util_pct": avg_sm,
+            "p50_sm_util_pct": pctl(row["sm"], 0.50),
+            "p90_sm_util_pct": pctl(row["sm"], 0.90),
+            "max_sm_util_pct": max(row["sm"]) if row["sm"] else 0.0,
+            "avg_mem_util_pct": avg(row["mem"]),
+            "max_mem_util_pct": max(row["mem"]) if row["mem"] else 0.0,
+            "avg_power_w": avg(row["power"]),
+            "max_power_w": max(row["power"]) if row["power"] else 0.0,
+            "estimated_samples": row["estimated_samples"],
+            "stage_gpu_busy_ms": row["total_ms"] * avg_sm / 100.0,
         }
     return stats
 
@@ -271,7 +457,72 @@ def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
     write(path, svg_base(width, height, body))
 
 
-def write_csvs(out_dir: Path, stats, chunks):
+def gpu_utilization_svg(path: Path, gpu_samples, intervals):
+    width = 1180
+    left, chart_w = 80, 1010
+    device_ids = sorted({sample["device"] for sample in gpu_samples})
+    if not gpu_samples or not device_ids:
+        body = ['<rect width="1180" height="180" fill="#ffffff"/>', '<text x="40" y="42" class="title">GPU 利用率时间线</text>', '<text x="40" y="72" class="subtitle">未解析到 [DUPLEX_GPU] sample</text>']
+        write(path, svg_base(width, 180, body))
+        return
+
+    sample_min = min(sample["t_ms"] for sample in gpu_samples)
+    sample_max = max(sample["t_ms"] for sample in gpu_samples)
+    interval_min = min([interval["begin_ms"] for interval in intervals] + [sample_min])
+    interval_max = max([interval["end_ms"] for interval in intervals] + [sample_max])
+    start_ms = min(sample_min, interval_min)
+    end_ms = max(sample_max, interval_max)
+    span = max(1.0, end_ms - start_ms)
+    device_h = 115
+    stage_top = 96 + len(device_ids) * device_h
+    height = stage_top + 220
+    body = ['<rect width="1180" height="%d" fill="#ffffff"/>' % height, '<text x="40" y="42" class="title">GPU 利用率时间线</text>', '<text x="40" y="66" class="subtitle">蓝线=SM util，橙线=memory controller util；下方为主要阶段 interval</text>']
+
+    def x_of(t_ms):
+        return left + (t_ms - start_ms) / span * chart_w
+
+    for tick in range(int(start_ms // 100 * 100), int(end_ms) + 101, 100):
+        x = x_of(tick)
+        body += [f'<line x1="{x:.1f}" y1="84" x2="{x:.1f}" y2="{height - 40}" stroke="#edf1f7"/>', f'<text x="{x - 18:.1f}" y="{height - 18}" class="tiny">{tick}</text>']
+
+    for idx, device in enumerate(device_ids):
+        y0 = 90 + idx * device_h
+        body += [f'<rect x="40" y="{y0 - 10}" width="1070" height="92" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>', f'<text x="50" y="{y0 + 10}" class="label" font-weight="700">device {device}</text>']
+        for pct in (0, 50, 100):
+            y = y0 + 70 - pct / 100.0 * 62
+            body += [f'<line x1="{left}" y1="{y:.1f}" x2="{left + chart_w}" y2="{y:.1f}" stroke="#e8edf5"/>', f'<text x="46" y="{y + 4:.1f}" class="tiny">{pct}%</text>']
+        samples = [sample for sample in gpu_samples if sample["device"] == device]
+        for key, color in (("sm_util_pct", "#2f6fed"), ("mem_util_pct", "#f58518")):
+            points = []
+            for sample in samples:
+                value = sample[key]
+                if value < 0:
+                    continue
+                points.append(f'{x_of(sample["t_ms"]):.1f},{y0 + 70 - min(100.0, value) / 100.0 * 62:.1f}')
+            if len(points) >= 2:
+                body.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="1.8"/>')
+
+    stage_colors = {stage: color for stage, color in STAGE_ROWS}
+    focus_stages = ["llm.prefill", "llm.decode", "tts.infer", "t2w.infer", "vision.encode", "audio.encode"]
+    lane_y = {stage: stage_top + 22 + idx * 26 for idx, stage in enumerate(focus_stages)}
+    body += [f'<text x="40" y="{stage_top}" class="label" font-weight="700">stage intervals</text>']
+    for stage in focus_stages:
+        y = lane_y[stage]
+        body += [f'<text x="40" y="{y + 10}" class="tiny">{esc(stage)}</text>', f'<line x1="{left}" y1="{y + 5}" x2="{left + chart_w}" y2="{y + 5}" stroke="#edf1f7"/>']
+    for interval in intervals:
+        stage = interval["stage"]
+        if stage not in lane_y:
+            continue
+        x = x_of(interval["begin_ms"])
+        w = max(1.5, (interval["end_ms"] - interval["begin_ms"]) / span * chart_w)
+        y = lane_y[stage]
+        body.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="11" fill="{stage_colors.get(stage, "#8b95a5")}" opacity="0.58" rx="3"/>')
+
+    body += ['<rect x="875" y="90" width="220" height="52" fill="#ffffff" stroke="#d6dde8" rx="10"/>', '<line x1="895" y1="110" x2="930" y2="110" stroke="#2f6fed" stroke-width="2"/><text x="940" y="114" class="small">SM util</text>', '<line x1="895" y1="132" x2="930" y2="132" stroke="#f58518" stroke-width="2"/><text x="940" y="136" class="small">mem util</text>']
+    write(path, svg_base(width, height, body))
+
+
+def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens):
     with (out_dir / "omni-duplex-stage-stats.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["stage", "n", "total_ms", "avg_ms", "p50_ms", "p90_ms", "min_ms", "max_ms"])
@@ -283,6 +534,22 @@ def write_csvs(out_dir: Path, stats, chunks):
         writer.writerow(["chunk", "prefill_ms", "decode_ms", "total_ms", "n_past", "decision", "text"])
         for chunk in chunks:
             writer.writerow([chunk["chunk"], f'{chunk["prefill_ms"]:.3f}', f'{chunk["decode_ms"]:.3f}', f'{chunk["total_ms"]:.3f}', chunk["n_past"], chunk["decision"], chunk["text"]])
+    with (out_dir / "omni-duplex-gpu-samples.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["sample_id", "t_ms", "device", "sm_util_pct", "mem_util_pct", "gpu_used_mb", "gpu_total_mb", "power_w", "temp_c", "graphics_clock_mhz", "mem_clock_mhz"])
+        for sample in gpu_samples:
+            writer.writerow([sample["sample_id"], f'{sample["t_ms"]:.3f}', sample["device"], sample["sm_util_pct"], sample["mem_util_pct"], sample["gpu_used_mb"], sample["gpu_total_mb"], sample["power_w"], sample["temp_c"], sample["graphics_clock_mhz"], sample["mem_clock_mhz"]])
+    with (out_dir / "omni-duplex-stage-gpu-stats.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["stage", "device", "n_intervals", "n_samples", "total_ms", "avg_sm_util_pct", "p50_sm_util_pct", "p90_sm_util_pct", "max_sm_util_pct", "avg_mem_util_pct", "max_mem_util_pct", "avg_power_w", "max_power_w", "estimated_samples", "stage_gpu_busy_ms"])
+        for key in sorted(gpu_stats):
+            row = gpu_stats[key]
+            writer.writerow([row["stage"], row["device"], row["n_intervals"], row["n_samples"], f'{row["total_ms"]:.3f}', f'{row["avg_sm_util_pct"]:.3f}', f'{row["p50_sm_util_pct"]:.3f}', f'{row["p90_sm_util_pct"]:.3f}', f'{row["max_sm_util_pct"]:.3f}', f'{row["avg_mem_util_pct"]:.3f}', f'{row["max_mem_util_pct"]:.3f}', f'{row["avg_power_w"]:.3f}', f'{row["max_power_w"]:.3f}', row["estimated_samples"], f'{row["stage_gpu_busy_ms"]:.3f}'])
+    with (out_dir / "omni-duplex-tts-token-stats.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["chunk", "tts_chunk", "dur_ms", "llm_tokens", "filtered_llm_tokens", "condition_tokens", "audio_tokens_generated", "is_end_of_turn", "flush_only", "audio_tokens_per_ms", "ms_per_audio_token", "has_audio_token_detail"])
+        for row in tts_tokens:
+            writer.writerow([row["chunk"], row["tts_chunk"], f'{row["dur_ms"]:.3f}', row["llm_tokens"], row["filtered_llm_tokens"], row["condition_tokens"], row["audio_tokens_generated"], row["is_end_of_turn"], row["flush_only"], f'{row["audio_tokens_per_ms"]:.6f}', f'{row["ms_per_audio_token"]:.3f}', row["has_audio_token_detail"]])
 
 
 def stage_kind(stage: str) -> str:
@@ -328,7 +595,27 @@ def write_stage_timing_table(path: Path, stats):
     write(path, "\n".join(lines))
 
 
-def write_report(path: Path, log_path: Path, text: str, events, chunks, stats):
+def gpu_stage_summary(gpu_stats, stage):
+    rows = [row for (row_stage, _), row in gpu_stats.items() if row_stage == stage]
+    if not rows:
+        return None
+    total_samples = sum(row["n_samples"] for row in rows)
+    avg_sm = avg(row["avg_sm_util_pct"] for row in rows)
+    max_sm = max(row["max_sm_util_pct"] for row in rows)
+    avg_power = avg(row["avg_power_w"] for row in rows)
+    estimated = sum(row["estimated_samples"] for row in rows)
+    devices = ",".join(str(row["device"]) for row in sorted(rows, key=lambda item: item["device"]))
+    return {
+        "devices": devices,
+        "total_samples": total_samples,
+        "avg_sm": avg_sm,
+        "max_sm": max_sm,
+        "avg_power": avg_power,
+        "estimated": estimated,
+    }
+
+
+def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens):
     decisions = Counter(c["decision"] for c in chunks)
     event_counts = Counter((e["stage"], e["event"]) for e in events)
     user_chunks = chunks[1:] if len(chunks) > 1 else chunks
@@ -338,6 +625,8 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats):
     rss = [e["rss_mb"] for e in events if e["rss_mb"] >= 0]
     def st(stage, key="avg"):
         return stats.get(stage, {}).get(key, 0.0)
+    tts_tokens_with_detail = [row for row in tts_tokens if row["has_audio_token_detail"]]
+    tts_audio_values = [row["audio_tokens_generated"] for row in tts_tokens_with_detail]
     rss_range = f"{min(rss):.0f}-{max(rss):.0f} MB" if rss else "NA"
     gpu_range = f"{min(gpu):.0f}-{max(gpu):.0f} MB" if gpu else "NA"
     lines = [
@@ -360,7 +649,9 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats):
         "",
         "![异步重叠时间线](figures/omni-duplex-overlap-timeline.svg)",
         "",
-        "完整阶段用时统计表见 [`omni-duplex-stage-timing-table.md`](omni-duplex-stage-timing-table.md)，CSV 见 `omni-duplex-stage-stats.csv`。",
+        "![GPU 利用率时间线](figures/omni-duplex-gpu-utilization.svg)",
+        "",
+        "完整阶段用时统计表见 [`omni-duplex-stage-timing-table.md`](omni-duplex-stage-timing-table.md)，CSV 见 `omni-duplex-stage-stats.csv`、`omni-duplex-gpu-samples.csv`、`omni-duplex-stage-gpu-stats.csv` 和 `omni-duplex-tts-token-stats.csv`。",
         "",
         "## 主要结论",
         "",
@@ -368,7 +659,51 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats):
         f"2. LLM KV prefill 在后台线程执行，平均约 `{st('llm.prefill'):.1f} ms`；API `decode` 通过 `wait.llm_prefill_done` 等待它，因此当前 decode API 不是纯采样耗时。",
         f"3. SPEAK 比 LISTEN 更慢：SPEAK chunk 的 decode 均值约 `{avg(c['decode_ms'] for c in speak):.1f} ms`，LISTEN chunk 约 `{avg(c['decode_ms'] for c in listen):.1f} ms`。",
         f"4. TTS/T2W 是后台链路。`tts.infer` 平均约 `{st('tts.infer'):.1f} ms`，`t2w.infer` 平均约 `{st('t2w.infer'):.1f} ms`，但它们可能与后续 chunk 重叠。",
-        "5. 当前日志存在多线程输出交织，部分 `[DUPLEX_PERF]` 行被普通日志插入，导致 start/end 数量不完全一致。建议给性能日志加互斥或写入独立文件，并为 TTS/T2W 增加稳定的 `utterance_id` / `audio_chunk_id`。",
+        "5. `[DUPLEX_PERF]` 带 `seq` 后可以按 `(t_ms, seq)` 稳定排序；TTS/T2W 仍建议继续增加稳定的 `utterance_id` / `audio_chunk_id` 来做跨线程归因。",
+        "",
+        "## GPU 利用率",
+        "",
+    ]
+    if gpu_samples:
+        lines.append(f"- 解析到 `{len(gpu_samples)}` 条 `[DUPLEX_GPU]` sample，覆盖 device：`{', '.join(str(d) for d in sorted({s['device'] for s in gpu_samples}))}`。")
+        for stage in ["tts.infer", "llm.decode", "llm.prefill", "t2w.infer"]:
+            row = gpu_stage_summary(gpu_stats, stage)
+            if row:
+                lines.append(f"- `{stage}`: avg SM `{row['avg_sm']:.1f}%`, max `{row['max_sm']:.1f}%`, avg power `{row['avg_power']:.1f} W`, samples `{row['total_samples']}`, estimated `{row['estimated']}`。")
+        lines.append("- 低 SM util + 高耗时的阶段优先检查 CPU、IO、队列和同步点；`stage_gpu_busy_ms` 仅用于单阶段观察，不应跨重叠阶段相加。")
+    elif gpu_statuses:
+        reasons = ", ".join(f"{status['event']}:{status['reason']}" for status in gpu_statuses)
+        lines.append(f"- 未解析到 GPU sample；状态：`{reasons}`。")
+    else:
+        lines.append("- 未解析到 `[DUPLEX_GPU]` sample。运行时设置 `OMNI_GPU_PROF=1` 可启用 NVML 采样。")
+    lines += [
+        "",
+        "## TTS Token 规模",
+        "",
+    ]
+    if tts_tokens_with_detail:
+        lines.append(f"- 解析到 `{len(tts_tokens_with_detail)}` 次 `tts.infer` audio token 输出；总计 `{sum(tts_audio_values)}` 个 audio token。")
+        lines.append(f"- 每次 `tts.infer` 输出 token：平均 `{avg(tts_audio_values):.1f}`，p50 `{statistics.median(tts_audio_values):.1f}`，p90 `{pctl(tts_audio_values, 0.90):.1f}`，范围 `{min(tts_audio_values)}-{max(tts_audio_values)}`。")
+        per_token = [row["ms_per_audio_token"] for row in tts_tokens_with_detail if row["ms_per_audio_token"] > 0]
+        if per_token:
+            lines.append(f"- TTS 每 audio token 成本：平均 `{avg(per_token):.2f} ms/token`，p50 `{statistics.median(per_token):.2f} ms/token`。")
+        lines += [
+            "",
+            "| chunk | tts_chunk | dur ms | llm tokens | filtered | condition | audio tokens | ms/token | end_of_turn | flush_only |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in tts_tokens_with_detail:
+            lines.append(
+                f"| {row['chunk']} | {row['tts_chunk']} | {row['dur_ms']:.1f} | "
+                f"{row['llm_tokens']} | {row['filtered_llm_tokens']} | {row['condition_tokens']} | "
+                f"{row['audio_tokens_generated']} | {row['ms_per_audio_token']:.2f} | "
+                f"{row['is_end_of_turn']} | {row['flush_only']} |"
+            )
+    elif tts_tokens:
+        lines.append("- 当前日志里的 `tts.infer` detail 还没有 `audio_tokens_generated` 字段；请用更新后的二进制重新跑一次 benchmark 后再分析。")
+    else:
+        lines.append("- 未解析到 `tts.infer` end 事件。")
+    lines += [
         "",
         "## 阶段耗时表",
         "",
@@ -401,21 +736,26 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", type=Path, default=Path("/cache/hanqingzhe/llama.cpp-omni/duplex_omni_tts_gpu_4_7.log"))
+    parser.add_argument("--gpu-log", type=Path, default=None, help="Optional separate OMNI_GPU_PROF_FILE log")
     parser.add_argument("--out-dir", type=Path, default=Path("/cache/hanqingzhe/llama.cpp-omni/docs/development"))
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    text, events, chunks = parse_log(args.log)
+    text, events, chunks, gpu_samples, gpu_statuses = parse_log(args.log, args.gpu_log)
     stats = stage_stats(events)
+    tts_tokens = tts_token_rows(events)
+    intervals = build_stage_intervals(events)
+    gpu_stats = stage_gpu_stats(intervals, gpu_samples)
     figures = args.out_dir / "figures"
     pipeline_svg(figures / "omni-duplex-pipeline.svg")
     stage_latency_svg(figures / "omni-duplex-stage-latency.svg", stats)
     chunk_latency_svg(figures / "omni-duplex-chunk-latency.svg", chunks)
     overlap_svg(figures / "omni-duplex-overlap-timeline.svg", events)
-    write_csvs(args.out_dir, stats, chunks)
+    gpu_utilization_svg(figures / "omni-duplex-gpu-utilization.svg", gpu_samples, intervals)
+    write_csvs(args.out_dir, stats, chunks, gpu_samples, gpu_stats, tts_tokens)
     write_stage_timing_table(args.out_dir / "omni-duplex-stage-timing-table.md", stats)
-    write_report(args.out_dir / "omni-duplex-tts-gpu-4-7-report.md", args.log, text, events, chunks, stats)
-    print(f"parsed_events={len(events)} raw_markers={text.count('[DUPLEX_PERF]')} chunks={len(chunks)}")
+    write_report(args.out_dir / "omni-duplex-tts-gpu-4-7-report.md", args.log, text, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens)
+    print(f"parsed_events={len(events)} raw_markers={text.count('[DUPLEX_PERF]')} chunks={len(chunks)} gpu_samples={len(gpu_samples)} tts_token_rows={len(tts_tokens)}")
     print(f"wrote={args.out_dir / 'omni-duplex-tts-gpu-4-7-report.md'}")
     print(f"stage_table={args.out_dir / 'omni-duplex-stage-timing-table.md'}")
     print(f"figures={figures}")
