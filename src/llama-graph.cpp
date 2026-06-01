@@ -632,6 +632,59 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_awq_marlin_mm(
+         ggml_tensor * cur,
+         ggml_tensor * qweight,
+         ggml_tensor * qzeros,
+         ggml_tensor * scales,
+                 int   il) const {
+    GGML_ASSERT(cur != nullptr);
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(qzeros != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(loras->empty() && "LoRA is not supported on the AWQ Marlin path yet");
+
+    if (cur->type != GGML_TYPE_F16 && cur->type != GGML_TYPE_BF16) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "awq_marlin_input", il);
+    }
+
+    // Keep a placeholder src in the graph; the CUDA backend allocates the real
+    // Marlin workspace at execution time based on the active device.
+    ggml_tensor * workspace = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    cb(workspace, "awq_marlin_workspace", il);
+
+    ggml_tensor * res = ggml_marlin_w4a16(ctx0, cur, qweight, scales, qzeros, workspace);
+    cb(res, "awq_marlin_mm", il);
+
+    return res;
+}
+
+ggml_tensor * llm_graph_context::build_gptq_marlin_mm(
+         ggml_tensor * cur,
+         ggml_tensor * qweight,
+         ggml_tensor * scales,
+                 int   il) const {
+    GGML_ASSERT(cur != nullptr);
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(loras->empty() && "LoRA is not supported on the GPTQ Marlin path yet");
+
+    // The current GPTQ-W8 Marlin path uses F16 activations.
+    if (cur->type != GGML_TYPE_F16) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "gptq_marlin_input", il);
+    }
+
+    ggml_tensor * workspace = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    cb(workspace, "gptq_marlin_workspace", il);
+
+    ggml_tensor * res = ggml_marlin_gptq_w8(ctx0, cur, qweight, scales, workspace);
+    cb(res, "gptq_marlin_mm", il);
+
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -666,6 +719,11 @@ ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * mb,
        llm_norm_type   type,
                  int   il) const {
+    // CUDA norm/fused-norm paths currently assume F32 source tensors.
+    if (cur->type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    }
+
     switch (type) {
         case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
@@ -1568,8 +1626,19 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * k_store = k_cur;
+        ggml_tensor * v_store = v_cur;
+
+        // KV cache set_rows path currently requires F32 source tensors.
+        if (k_store->type != GGML_TYPE_F32) {
+            k_store = ggml_cast(ctx0, k_store, GGML_TYPE_F32);
+        }
+        if (v_store->type != GGML_TYPE_F32) {
+            v_store = ggml_cast(ctx0, v_store, GGML_TYPE_F32);
+        }
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_store, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_store, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();

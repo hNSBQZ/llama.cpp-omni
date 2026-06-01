@@ -231,6 +231,7 @@ private:
     const llama_model & model;
 
     llama_cparams       cparams;
+
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
 

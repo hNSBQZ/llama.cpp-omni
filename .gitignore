@@ -121,6 +121,7 @@ autogen-*.md
 # Models
 
 models/*
+/models/MiniCPM-o-4_5-gguf/
 models-mnt
 !models/.editorconfig
 !models/ggml-vocab-*.gguf*
@@ -132,9 +133,15 @@ zig-cache/
 
 # Logs
 
+/log/
 ppl-*.txt
 qnt-*.txt
 perf-*.txt
+awq_*_dump*/
+awq_*_full_dump*/
+awq_*_debug*/
+awq_*_dump*.bin
+awq_*_dump*.meta
 
 # Examples
 
@@ -201,3 +208,12 @@ poetry.toml
 # Output directories
 tools/omni/output/
 tools/omni/output_*/
+
+# Local analysis files
+log.token2wav.fixed
+log_Q_4
+log_Q_8
+resource.csv
+指标解释.txt
+modify.md
+bench_long_prompt.txt

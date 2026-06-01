@@ -1,22 +1,22 @@
 #pragma once
 
-#include "llama.h"
 #include "llama-cparams.h"
+#include "llama.h"
 
 #include <bitset>
 #include <cassert>
-#include <vector>
-#include <set>
 #include <map>
+#include <set>
+#include <vector>
 
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
-public:
+  public:
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
-            shift[i] =  0;
+            shift[i] = 0;
             seq[i].reset();
         }
 
@@ -37,9 +37,7 @@ public:
         }
     }
 
-    uint32_t size() const {
-        return pos.size();
-    }
+    uint32_t size() const { return pos.size(); }
 
     void resize(uint32_t n) {
         pos.resize(n);
@@ -56,25 +54,17 @@ public:
         return pos[i] == -1;
     }
 
-    uint32_t get_used() const {
-        return used.size();
-    }
+    uint32_t get_used() const { return used.size(); }
 
     // the index of the first cell that is used
     // return 0 if no cells are used
-    uint32_t used_min() const {
-        return used.empty() ? 0 : *used.begin();
-    }
+    uint32_t used_min() const { return used.empty() ? 0 : *used.begin(); }
 
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
-    uint32_t used_max_p1() const {
-        return used.empty() ? 0 : *used.rbegin() + 1;
-    }
+    uint32_t used_max_p1() const { return used.empty() ? 0 : *used.rbegin() + 1; }
 
-    bool get_has_shift() const {
-        return has_shift;
-    }
+    bool get_has_shift() const { return has_shift; }
 
     // move cell isrc to idst (used during defrag)
     //void mv(uint32_t isrc, uint32_t idst) {
@@ -202,7 +192,7 @@ public:
         seq_pos_rm(i);
         seq[i].reset();
 
-        pos[i] = -1;
+        pos[i]   = -1;
         shift[i] = 0;
 
         used.erase(i);
@@ -220,7 +210,7 @@ public:
         seq_pos_dec(seq_id, pos[i]);
 
         if (seq[i].none()) {
-            pos[i] = -1;
+            pos[i]   = -1;
             shift[i] = 0;
 
             used.erase(i);
@@ -249,7 +239,7 @@ public:
             seq_pos_rm(i);
             seq[i].reset();
 
-            pos[i] = -1;
+            pos[i]   = -1;
             shift[i] = 0;
 
             used.erase(i);
@@ -377,14 +367,14 @@ public:
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
+        pos[i] += d;
         shift[i] += d;
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
-            pos[i] = -1;
+            pos[i]   = -1;
             shift[i] = 0;
 
             used.erase(i);
@@ -408,7 +398,7 @@ public:
 
         seq_pos_rm(i);
 
-        pos[i]   /= d;
+        pos[i] /= d;
         shift[i] += p_old - pos[i];
 
         seq_pos_add(i);
@@ -416,7 +406,7 @@ public:
         has_shift = true;
     }
 
-private:
+  private:
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
@@ -467,9 +457,7 @@ private:
         }
     }
 
-    void seq_pos_inc(llama_seq_id s, llama_pos p) {
-        seq_pos[s][p]++;
-    }
+    void seq_pos_inc(llama_seq_id s, llama_pos p) { seq_pos[s][p]++; }
 
     // remove cell i
     void seq_pos_rm(uint32_t i) {

@@ -23,6 +23,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/marlin-op.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -403,7 +404,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
-    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 33; // 8 GB(原32GB)  // modified
 
     int device;
     CUdeviceptr pool_addr = 0;
@@ -2000,6 +2001,10 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    static const bool trace_mmvf = []() {
+        const char * value = std::getenv("LLAMA_CUDA_TRACE_MMVF");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2059,6 +2064,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
     if (!split && use_mul_mat_vec_f) {
+        if (trace_mmvf) {
+            GGML_LOG_INFO("%s: using mul_mat_vec_f src0='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst='%s' ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    __func__,
+                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        }
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -2073,6 +2085,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // general KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        if (trace_mmvf) {
+            GGML_LOG_INFO("%s: using split/op mul_mat_vec_f src0='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] src1='%s' type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] dst='%s' ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                    __func__,
+                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    dst->name, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+        }
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
@@ -2406,6 +2425,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+            break;
+        case GGML_OP_MARLIN_W4A16:
+            ggml_cuda_op_marlin_w4a16(ctx, dst);
+            break;
+        case GGML_OP_MARLIN_GPTQ_W8:
+            ggml_cuda_op_marlin_gptq_w8(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
@@ -3460,6 +3485,49 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
+        case GGML_OP_MARLIN_W4A16:
+            {
+                const ggml_tensor * a         = op->src[0];
+                const ggml_tensor * qweight   = op->src[1];
+                const ggml_tensor * scales    = op->src[2];
+                const ggml_tensor * qzeros    = op->src[3];
+                const ggml_tensor * workspace = op->src[4];
+
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                return cc >= GGML_CUDA_CC_TURING &&
+                    a != nullptr && qweight != nullptr && scales != nullptr && qzeros != nullptr && workspace != nullptr &&
+                    ggml_is_contiguous(a) &&
+                    ggml_is_contiguous(qweight) &&
+                    ggml_is_contiguous(scales) &&
+                    ggml_is_contiguous(qzeros) &&
+                    ggml_is_contiguous(workspace) &&
+                    (a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16) &&
+                    qweight->type == GGML_TYPE_I32 &&
+                    qzeros->type == GGML_TYPE_I32 &&
+                    workspace->type == GGML_TYPE_I32 &&
+                    op->type == a->type;
+            } break;
+        case GGML_OP_MARLIN_GPTQ_W8:
+            {
+                const ggml_tensor * a         = op->src[0];
+                const ggml_tensor * qweight   = op->src[1];
+                const ggml_tensor * scales    = op->src[2];
+                const ggml_tensor * workspace = op->src[3];
+
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                return cc >= GGML_CUDA_CC_TURING &&
+                    a != nullptr && qweight != nullptr && scales != nullptr && workspace != nullptr &&
+                    ggml_is_contiguous(a) &&
+                    ggml_is_contiguous(qweight) &&
+                    ggml_is_contiguous(scales) &&
+                    ggml_is_contiguous(workspace) &&
+                    a->type == GGML_TYPE_F16 &&
+                    qweight->type == GGML_TYPE_I32 &&
+                    scales->type == GGML_TYPE_F16 &&
+                    workspace->type == GGML_TYPE_I32 &&
+                    qweight->ne[1] * 4 == scales->ne[1] &&
+                    op->type == a->type;
+            } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
@@ -3688,6 +3756,8 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MARLIN_W4A16:
+        case GGML_OP_MARLIN_GPTQ_W8:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
