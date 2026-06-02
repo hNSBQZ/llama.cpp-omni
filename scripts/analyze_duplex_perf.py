@@ -56,6 +56,8 @@ STAGE_ROWS = [
     ("t2w.write", "#9e9ac8"),
 ]
 
+TOKEN_SPEED_STAGES = ["llm.prefill", "llm.decode", "tts.infer"]
+
 
 def esc(value: object) -> str:
     return html.escape(str(value), quote=True)
@@ -91,6 +93,28 @@ def parse_detail(detail: str):
         key, value = part.split("=", 1)
         result[key.strip()] = value.strip()
     return result
+
+
+def detail_int(detail, key, default=0):
+    try:
+        return int(detail.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def token_count_for_event(event):
+    detail = parse_detail(event["detail"])
+    if "tokens" in detail:
+        return detail_int(detail, "tokens", -1)
+    if event["stage"] == "tts.infer":
+        return detail_int(detail, "audio_tokens_generated", -1)
+    if event["stage"] == "llm.prefill":
+        # Old logs did not have a dedicated token field; n_past_delta is the
+        # closest available KV-token proxy when no sliding happened.
+        return detail_int(detail, "n_past_delta", -1)
+    if event["stage"] == "llm.decode":
+        return detail_int(detail, "tokens", -1)
+    return -1
 
 
 def parse_log(path: Path, gpu_log_path=None):
@@ -182,6 +206,45 @@ def stage_stats(events):
     return stats
 
 
+def stage_token_stats(events):
+    grouped = defaultdict(lambda: {
+        "n": 0,
+        "tokens": 0,
+        "total_ms": 0.0,
+        "event_tokens_per_s": [],
+        "event_ms_per_token": [],
+    })
+    for event in events:
+        if event["stage"] not in TOKEN_SPEED_STAGES or event["event"] != "end" or event["dur_ms"] < 0:
+            continue
+        tokens = token_count_for_event(event)
+        if tokens < 0:
+            continue
+        row = grouped[event["stage"]]
+        row["n"] += 1
+        row["tokens"] += tokens
+        row["total_ms"] += event["dur_ms"]
+        if tokens > 0 and event["dur_ms"] > 0:
+            row["event_tokens_per_s"].append(tokens * 1000.0 / event["dur_ms"])
+            row["event_ms_per_token"].append(event["dur_ms"] / tokens)
+
+    stats = {}
+    for stage, row in grouped.items():
+        tokens = row["tokens"]
+        total_ms = row["total_ms"]
+        stats[stage] = {
+            "n": row["n"],
+            "tokens": tokens,
+            "total_ms": total_ms,
+            "tokens_per_s": tokens * 1000.0 / total_ms if tokens > 0 and total_ms > 0 else 0.0,
+            "ms_per_token": total_ms / tokens if tokens > 0 else 0.0,
+            "avg_event_tokens_per_s": avg(row["event_tokens_per_s"]),
+            "p50_event_tokens_per_s": statistics.median(row["event_tokens_per_s"]) if row["event_tokens_per_s"] else 0.0,
+            "avg_event_ms_per_token": avg(row["event_ms_per_token"]),
+        }
+    return stats
+
+
 def tts_token_rows(events):
     rows = []
     for event in sorted(events, key=lambda item: (item["t_ms"], item.get("seq", -1))):
@@ -196,7 +259,10 @@ def tts_token_rows(events):
         llm_tokens = to_int("llm_tokens")
         filtered_llm_tokens = to_int("filtered_llm_tokens", llm_tokens)
         condition_tokens = to_int("condition_tokens")
+        compute_tokens = to_int("compute_tokens", to_int("tokens", -1))
         audio_tokens = to_int("audio_tokens_generated", -1)
+        if compute_tokens < 0:
+            compute_tokens = audio_tokens
         rows.append({
             "chunk": event["chunk"],
             "tts_chunk": to_int("tts_chunk", event["chunk"]),
@@ -204,10 +270,13 @@ def tts_token_rows(events):
             "llm_tokens": llm_tokens,
             "filtered_llm_tokens": filtered_llm_tokens,
             "condition_tokens": condition_tokens,
+            "compute_tokens": compute_tokens,
             "audio_tokens_generated": audio_tokens,
             "is_end_of_turn": to_int("is_end_of_turn"),
             "flush_only": to_int("flush_only"),
+            "compute_tokens_per_s": compute_tokens * 1000.0 / event["dur_ms"] if compute_tokens >= 0 and event["dur_ms"] > 0 else 0.0,
             "audio_tokens_per_ms": audio_tokens / event["dur_ms"] if audio_tokens >= 0 and event["dur_ms"] > 0 else 0.0,
+            "audio_tokens_per_s": audio_tokens * 1000.0 / event["dur_ms"] if audio_tokens >= 0 and event["dur_ms"] > 0 else 0.0,
             "ms_per_audio_token": event["dur_ms"] / audio_tokens if audio_tokens > 0 else 0.0,
             "has_audio_token_detail": int(audio_tokens >= 0),
         })
@@ -522,7 +591,7 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
     write(path, svg_base(width, height, body))
 
 
-def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens):
+def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens, token_stats):
     with (out_dir / "omni-duplex-stage-stats.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["stage", "n", "total_ms", "avg_ms", "p50_ms", "p90_ms", "min_ms", "max_ms"])
@@ -545,11 +614,27 @@ def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens)
         for key in sorted(gpu_stats):
             row = gpu_stats[key]
             writer.writerow([row["stage"], row["device"], row["n_intervals"], row["n_samples"], f'{row["total_ms"]:.3f}', f'{row["avg_sm_util_pct"]:.3f}', f'{row["p50_sm_util_pct"]:.3f}', f'{row["p90_sm_util_pct"]:.3f}', f'{row["max_sm_util_pct"]:.3f}', f'{row["avg_mem_util_pct"]:.3f}', f'{row["max_mem_util_pct"]:.3f}', f'{row["avg_power_w"]:.3f}', f'{row["max_power_w"]:.3f}', row["estimated_samples"], f'{row["stage_gpu_busy_ms"]:.3f}'])
+    with (out_dir / "omni-duplex-stage-token-speed.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["stage", "n", "tokens", "total_ms", "tokens_per_s", "ms_per_token", "avg_event_tokens_per_s", "p50_event_tokens_per_s", "avg_event_ms_per_token"])
+        for stage in TOKEN_SPEED_STAGES:
+            row = token_stats.get(stage, {})
+            writer.writerow([
+                stage,
+                int(row.get("n", 0)),
+                int(row.get("tokens", 0)),
+                f'{row.get("total_ms", 0.0):.3f}',
+                f'{row.get("tokens_per_s", 0.0):.3f}',
+                f'{row.get("ms_per_token", 0.0):.6f}',
+                f'{row.get("avg_event_tokens_per_s", 0.0):.3f}',
+                f'{row.get("p50_event_tokens_per_s", 0.0):.3f}',
+                f'{row.get("avg_event_ms_per_token", 0.0):.6f}',
+            ])
     with (out_dir / "omni-duplex-tts-token-stats.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["chunk", "tts_chunk", "dur_ms", "llm_tokens", "filtered_llm_tokens", "condition_tokens", "audio_tokens_generated", "is_end_of_turn", "flush_only", "audio_tokens_per_ms", "ms_per_audio_token", "has_audio_token_detail"])
+        writer.writerow(["chunk", "tts_chunk", "dur_ms", "llm_tokens", "filtered_llm_tokens", "condition_tokens", "compute_tokens", "audio_tokens_generated", "is_end_of_turn", "flush_only", "compute_tokens_per_s", "audio_tokens_per_ms", "audio_tokens_per_s", "ms_per_audio_token", "has_audio_token_detail"])
         for row in tts_tokens:
-            writer.writerow([row["chunk"], row["tts_chunk"], f'{row["dur_ms"]:.3f}', row["llm_tokens"], row["filtered_llm_tokens"], row["condition_tokens"], row["audio_tokens_generated"], row["is_end_of_turn"], row["flush_only"], f'{row["audio_tokens_per_ms"]:.6f}', f'{row["ms_per_audio_token"]:.3f}', row["has_audio_token_detail"]])
+            writer.writerow([row["chunk"], row["tts_chunk"], f'{row["dur_ms"]:.3f}', row["llm_tokens"], row["filtered_llm_tokens"], row["condition_tokens"], row["compute_tokens"], row["audio_tokens_generated"], row["is_end_of_turn"], row["flush_only"], f'{row["compute_tokens_per_s"]:.3f}', f'{row["audio_tokens_per_ms"]:.6f}', f'{row["audio_tokens_per_s"]:.3f}', f'{row["ms_per_audio_token"]:.3f}', row["has_audio_token_detail"]])
 
 
 def stage_kind(stage: str) -> str:
@@ -615,7 +700,7 @@ def gpu_stage_summary(gpu_stats, stage):
     }
 
 
-def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens):
+def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens, token_stats):
     decisions = Counter(c["decision"] for c in chunks)
     event_counts = Counter((e["stage"], e["event"]) for e in events)
     user_chunks = chunks[1:] if len(chunks) > 1 else chunks
@@ -629,6 +714,8 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
     tts_audio_values = [row["audio_tokens_generated"] for row in tts_tokens_with_detail]
     rss_range = f"{min(rss):.0f}-{max(rss):.0f} MB" if rss else "NA"
     gpu_range = f"{min(gpu):.0f}-{max(gpu):.0f} MB" if gpu else "NA"
+    def speed(stage):
+        return token_stats.get(stage, {}).get("tokens_per_s", 0.0)
     lines = [
         "# Omni Duplex TTS GPU 实测性能报告",
         "",
@@ -637,6 +724,7 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         f"- Chunk：`{len(chunks)}`；SPEAK/LISTEN：`{decisions.get('speak', 0)}` / `{decisions.get('listen', 0)}`。",
         f"- API 口径：平均 prefill `{avg(c['prefill_ms'] for c in chunks):.1f} ms`，平均 decode `{avg(c['decode_ms'] for c in chunks):.1f} ms`，平均每 chunk `{avg(c['total_ms'] for c in chunks):.1f} ms`。",
         f"- 用户 chunk 口径（排除 `index=0`）：平均 prefill `{avg(c['prefill_ms'] for c in user_chunks):.1f} ms`，平均 decode `{avg(c['decode_ms'] for c in user_chunks):.1f} ms`，平均每 chunk `{avg(c['total_ms'] for c in user_chunks):.1f} ms`。",
+        f"- 阶段平均速度：`llm.prefill` `{speed('llm.prefill'):.2f} tok/s`，`llm.decode` `{speed('llm.decode'):.2f} tok/s`，`TTS.infer` `{speed('tts.infer'):.2f} compute tok/s`。",
         f"- n_past：峰值 `{max(c['n_past'] for c in chunks)}`，最终 `{chunks[-1]['n_past']}`；RSS 约 `{rss_range}`，GPU used 约 `{gpu_range}`。",
         "",
         "## 图表",
@@ -651,14 +739,14 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         "",
         "![GPU 利用率时间线](figures/omni-duplex-gpu-utilization.svg)",
         "",
-        "完整阶段用时统计表见 [`omni-duplex-stage-timing-table.md`](omni-duplex-stage-timing-table.md)，CSV 见 `omni-duplex-stage-stats.csv`、`omni-duplex-gpu-samples.csv`、`omni-duplex-stage-gpu-stats.csv` 和 `omni-duplex-tts-token-stats.csv`。",
+        "完整阶段用时统计表见 [`omni-duplex-stage-timing-table.md`](omni-duplex-stage-timing-table.md)，CSV 见 `omni-duplex-stage-stats.csv`、`omni-duplex-stage-token-speed.csv`、`omni-duplex-gpu-samples.csv`、`omni-duplex-stage-gpu-stats.csv` 和 `omni-duplex-tts-token-stats.csv`。",
         "",
         "## 主要结论",
         "",
         f"1. `vision.encode` / `audio.encode` 是输入侧 encoder 口径，平均约 `{st('vision.encode'):.1f}` / `{st('audio.encode'):.1f} ms`。",
-        f"2. LLM KV prefill 在后台线程执行，平均约 `{st('llm.prefill'):.1f} ms`；API `decode` 通过 `wait.llm_prefill_done` 等待它，因此当前 decode API 不是纯采样耗时。",
-        f"3. SPEAK 比 LISTEN 更慢：SPEAK chunk 的 decode 均值约 `{avg(c['decode_ms'] for c in speak):.1f} ms`，LISTEN chunk 约 `{avg(c['decode_ms'] for c in listen):.1f} ms`。",
-        f"4. TTS/T2W 是后台链路。`tts.infer` 平均约 `{st('tts.infer'):.1f} ms`，`t2w.infer` 平均约 `{st('t2w.infer'):.1f} ms`，但它们可能与后续 chunk 重叠。",
+        f"2. LLM KV prefill 在后台线程执行，平均约 `{st('llm.prefill'):.1f} ms`，平均速度 `{speed('llm.prefill'):.2f} tok/s`；API `decode` 通过 `wait.llm_prefill_done` 等待它，因此当前 decode API 不是纯采样耗时。",
+        f"3. LLM decode 平均速度 `{speed('llm.decode'):.2f} tok/s`；SPEAK chunk 的 decode 均值约 `{avg(c['decode_ms'] for c in speak):.1f} ms`，LISTEN chunk 约 `{avg(c['decode_ms'] for c in listen):.1f} ms`。",
+        f"4. TTS/T2W 是后台链路。`tts.infer` 平均约 `{st('tts.infer'):.1f} ms`、`{speed('tts.infer'):.2f} compute tok/s`，`t2w.infer` 平均约 `{st('t2w.infer'):.1f} ms`，但它们可能与后续 chunk 重叠。",
         "5. `[DUPLEX_PERF]` 带 `seq` 后可以按 `(t_ms, seq)` 稳定排序；TTS/T2W 仍建议继续增加稳定的 `utterance_id` / `audio_chunk_id` 来做跨线程归因。",
         "",
         "## GPU 利用率",
@@ -678,6 +766,23 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         lines.append("- 未解析到 `[DUPLEX_GPU]` sample。运行时设置 `OMNI_GPU_PROF=1` 可启用 NVML 采样。")
     lines += [
         "",
+        "## 阶段平均速度",
+        "",
+        "速度口径为该阶段所有 end 事件的 `compute tokens / total duration`；`llm.prefill` 的 token 包含文本控制标记 token 和音频/视觉 embedding token，`llm.decode` 包含模型采样 token 和手动 feed 的控制 token，`tts.infer` 包含 TTS 采样步数（含 EOS 等未输出 token）。",
+        "",
+        "| stage | n | tokens | total ms | tokens/s | ms/token |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for stage in TOKEN_SPEED_STAGES:
+        row = token_stats.get(stage, {})
+        display_stage = "TTS.infer" if stage == "tts.infer" else stage
+        lines.append(
+            f"| `{display_stage}` | {int(row.get('n', 0))} | {int(row.get('tokens', 0))} | "
+            f"{row.get('total_ms', 0.0):.1f} | {row.get('tokens_per_s', 0.0):.2f} | "
+            f"{row.get('ms_per_token', 0.0):.4f} |"
+        )
+    lines += [
+        "",
         "## TTS Token 规模",
         "",
     ]
@@ -687,16 +792,19 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         per_token = [row["ms_per_audio_token"] for row in tts_tokens_with_detail if row["ms_per_audio_token"] > 0]
         if per_token:
             lines.append(f"- TTS 每 audio token 成本：平均 `{avg(per_token):.2f} ms/token`，p50 `{statistics.median(per_token):.2f} ms/token`。")
+            output_total_ms = sum(row["dur_ms"] for row in tts_tokens_with_detail)
+            output_tok_s = sum(tts_audio_values) * 1000.0 / output_total_ms if output_total_ms > 0 else 0.0
+            lines.append(f"- TTS compute 速度：`{speed('tts.infer'):.2f} tok/s`；有效 audio 输出速度：`{output_tok_s:.2f} audio tok/s`（总体口径）。")
         lines += [
             "",
-            "| chunk | tts_chunk | dur ms | llm tokens | filtered | condition | audio tokens | ms/token | end_of_turn | flush_only |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| chunk | tts_chunk | dur ms | llm tokens | filtered | condition | compute tokens | audio tokens | ms/audio token | end_of_turn | flush_only |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in tts_tokens_with_detail:
             lines.append(
                 f"| {row['chunk']} | {row['tts_chunk']} | {row['dur_ms']:.1f} | "
                 f"{row['llm_tokens']} | {row['filtered_llm_tokens']} | {row['condition_tokens']} | "
-                f"{row['audio_tokens_generated']} | {row['ms_per_audio_token']:.2f} | "
+                f"{row['compute_tokens']} | {row['audio_tokens_generated']} | {row['ms_per_audio_token']:.2f} | "
                 f"{row['is_end_of_turn']} | {row['flush_only']} |"
             )
     elif tts_tokens:
@@ -744,6 +852,7 @@ def main():
     text, events, chunks, gpu_samples, gpu_statuses = parse_log(args.log, args.gpu_log)
     stats = stage_stats(events)
     tts_tokens = tts_token_rows(events)
+    token_stats = stage_token_stats(events)
     intervals = build_stage_intervals(events)
     gpu_stats = stage_gpu_stats(intervals, gpu_samples)
     figures = args.out_dir / "figures"
@@ -752,9 +861,9 @@ def main():
     chunk_latency_svg(figures / "omni-duplex-chunk-latency.svg", chunks)
     overlap_svg(figures / "omni-duplex-overlap-timeline.svg", events)
     gpu_utilization_svg(figures / "omni-duplex-gpu-utilization.svg", gpu_samples, intervals)
-    write_csvs(args.out_dir, stats, chunks, gpu_samples, gpu_stats, tts_tokens)
+    write_csvs(args.out_dir, stats, chunks, gpu_samples, gpu_stats, tts_tokens, token_stats)
     write_stage_timing_table(args.out_dir / "omni-duplex-stage-timing-table.md", stats)
-    write_report(args.out_dir / "omni-duplex-tts-gpu-4-7-report.md", args.log, text, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens)
+    write_report(args.out_dir / "omni-duplex-tts-gpu-4-7-report.md", args.log, text, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens, token_stats)
     print(f"parsed_events={len(events)} raw_markers={text.count('[DUPLEX_PERF]')} chunks={len(chunks)} gpu_samples={len(gpu_samples)} tts_token_rows={len(tts_tokens)}")
     print(f"wrote={args.out_dir / 'omni-duplex-tts-gpu-4-7-report.md'}")
     print(f"stage_table={args.out_dir / 'omni-duplex-stage-timing-table.md'}")

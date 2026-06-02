@@ -132,6 +132,12 @@ struct projector_model {
     bool initialized = false;
 };
 
+struct OmniPerfTokenStats {
+    long long calls = 0;
+    long long tokens = 0;
+    double duration_ms = 0.0;
+};
+
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
     struct audition_ctx * ctx_audio = NULL;
@@ -372,6 +378,10 @@ struct omni_context {
     // Timestamp for stream_decode start (used for WAV file naming)
     std::chrono::high_resolution_clock::time_point stream_decode_start_time;
     std::atomic<int> perf_current_chunk_index{-1};
+    std::mutex perf_token_stats_mtx;
+    OmniPerfTokenStats perf_llm_prefill;
+    OmniPerfTokenStats perf_llm_decode;
+    OmniPerfTokenStats perf_tts_infer;
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;

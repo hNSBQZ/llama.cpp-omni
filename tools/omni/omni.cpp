@@ -1005,9 +1005,12 @@ static bool eval_id_with_hidden(struct omni_context * ctx_omni, common_params* p
     return eval_tokens_with_hidden(ctx_omni, params, tokens, 1, n_past, hidden_states);
 }
 
-static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false) {
+static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false, int * n_tokens_out = nullptr) {
     std::string              str2     = str;
     std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
+    if (n_tokens_out != nullptr) {
+        *n_tokens_out = (int) embd_inp.size();
+    }
     return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb);
 }
 
@@ -4094,6 +4097,75 @@ static void omni_gpu_perf_sampler_stop() {
     }
 }
 
+static double omni_perf_tokens_per_s(long long tokens, double duration_ms) {
+    if (tokens <= 0 || duration_ms <= 0.0) {
+        return 0.0;
+    }
+    return (double) tokens * 1000.0 / duration_ms;
+}
+
+static std::string omni_perf_speed_detail(long long tokens, double duration_ms) {
+    std::ostringstream oss;
+    oss << ",tokens_per_s=" << std::fixed << std::setprecision(2)
+        << omni_perf_tokens_per_s(tokens, duration_ms);
+    if (tokens > 0 && duration_ms > 0.0) {
+        oss << ",ms_per_token=" << std::setprecision(4)
+            << (duration_ms / (double) tokens);
+    } else {
+        oss << ",ms_per_token=0.0000";
+    }
+    return oss.str();
+}
+
+static OmniPerfTokenStats * omni_perf_stage_stats(struct omni_context * ctx_omni, const char * stage) {
+    if (ctx_omni == nullptr || stage == nullptr) {
+        return nullptr;
+    }
+    if (std::strcmp(stage, "llm.prefill") == 0) {
+        return &ctx_omni->perf_llm_prefill;
+    }
+    if (std::strcmp(stage, "llm.decode") == 0) {
+        return &ctx_omni->perf_llm_decode;
+    }
+    if (std::strcmp(stage, "tts.infer") == 0) {
+        return &ctx_omni->perf_tts_infer;
+    }
+    return nullptr;
+}
+
+static void omni_perf_record_tokens(struct omni_context * ctx_omni, const char * stage, long long tokens, double duration_ms) {
+    if (tokens <= 0 || duration_ms < 0.0) {
+        return;
+    }
+    OmniPerfTokenStats * stats = omni_perf_stage_stats(ctx_omni, stage);
+    if (stats == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->perf_token_stats_mtx);
+    stats->calls += 1;
+    stats->tokens += tokens;
+    stats->duration_ms += duration_ms;
+}
+
+static void omni_perf_print_token_stats(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->perf_token_stats_mtx);
+    const auto print_one = [](const char * stage, const OmniPerfTokenStats & stats) {
+        if (stats.calls <= 0) {
+            return;
+        }
+        const double tokens_per_s = omni_perf_tokens_per_s(stats.tokens, stats.duration_ms);
+        const double ms_per_token = stats.tokens > 0 ? stats.duration_ms / (double) stats.tokens : 0.0;
+        print_with_timestamp("[DUPLEX_PERF_SUMMARY] stage=%s calls=%lld tokens=%lld total_ms=%.3f avg_tokens_per_s=%.2f avg_ms_per_token=%.4f\n",
+                             stage, stats.calls, stats.tokens, stats.duration_ms, tokens_per_s, ms_per_token);
+    };
+    print_one("llm.prefill", ctx_omni->perf_llm_prefill);
+    print_one("llm.decode", ctx_omni->perf_llm_decode);
+    print_one("tts.infer", ctx_omni->perf_tts_infer);
+}
+
 void omni_perf_mark(struct omni_context * ctx_omni,
                     const char * stage,
                     const char * event,
@@ -4143,6 +4215,8 @@ struct OmniPerfScope {
     const char * stage;
     int chunk_index;
     std::string detail;
+    long long tokens = 0;
+    bool has_tokens = false;
     std::chrono::steady_clock::time_point start;
 
     OmniPerfScope(omni_context * ctx_, const char * stage_, int chunk_index_, const std::string & detail_)
@@ -4155,10 +4229,20 @@ struct OmniPerfScope {
         detail = detail_;
     }
 
+    void set_tokens(long long tokens_) {
+        tokens = tokens_;
+        has_tokens = true;
+    }
+
     ~OmniPerfScope() {
         const auto end = std::chrono::steady_clock::now();
         const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        omni_perf_mark(ctx, stage, "end", chunk_index, duration_ms, detail.c_str());
+        std::string final_detail = detail;
+        if (has_tokens) {
+            final_detail += omni_perf_speed_detail(tokens, duration_ms);
+            omni_perf_record_tokens(ctx, stage, tokens, duration_ms);
+        }
+        omni_perf_mark(ctx, stage, "end", chunk_index, duration_ms, final_detail.c_str());
     }
 };
 
@@ -4875,6 +4959,7 @@ void omni_free(struct omni_context * ctx_omni) {
         }
     }
 
+    omni_perf_print_token_stats(ctx_omni);
     omni_gpu_perf_sampler_stop();
     
     delete ctx_omni->ctx_vision;
@@ -5117,6 +5202,16 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             const int kv_prefill_start_n_past = ctx_omni->n_past;
             auto kv_prefill_t0 = std::chrono::steady_clock::now();
             std::string kv_prefill_detail = "items=" + std::to_string(llm_embeds.size());
+            long long perf_prefill_text_tokens = 0;
+            long long perf_prefill_embed_tokens = 0;
+            auto eval_prefill_string = [&](const char * text) {
+                int n_text_tokens = 0;
+                bool ok = eval_string(ctx_omni, params, text, params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens);
+                if (ok) {
+                    perf_prefill_text_tokens += n_text_tokens;
+                }
+                return ok;
+            };
             omni_perf_mark(ctx_omni, "llm.prefill", "start", perf_chunk_index, -1.0, kv_prefill_detail.c_str());
 
             // 🔧 [重构] 逐个处理嵌入数据，正确添加特殊标记
@@ -5140,27 +5235,31 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     
                     // 🔧 [与 Python 对齐] 根据模式决定是否添加 <unit>
                     if (ctx_omni->duplex_mode) {
-                        eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("<unit><image>");
                     } else {
-                        eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("<image>");
                     }
                     
                     // Prefill overview embedding (第一个 chunk)
-                    prefill_with_emb(ctx_omni, params, embeds->vision_embed[0].data(), tokens_per_chunk, 
-                                    params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->n_past, false);
+                    if (prefill_with_emb(ctx_omni, params, embeds->vision_embed[0].data(), tokens_per_chunk,
+                                         params->n_batch, &ctx_omni->n_past)) {
+                        perf_prefill_embed_tokens += tokens_per_chunk;
+                    }
+                    eval_prefill_string("</image>");
                     
                     // 🔧 [高清模式 V2.6 schema] 如果有 slices，添加 <slice> 标记
                     // 格式: <image>(overview)</image><slice>(slice1)</slice><slice>(slice2)</slice>\n
                     if (has_slices) {
                         for (int i = 1; i < n_chunks; i++) {
-                            eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false);
-                            prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), tokens_per_chunk,
-                                            params->n_batch, &ctx_omni->n_past);
-                            eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false);
+                            eval_prefill_string("<slice>");
+                            if (prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), tokens_per_chunk,
+                                                 params->n_batch, &ctx_omni->n_past)) {
+                                perf_prefill_embed_tokens += tokens_per_chunk;
+                            }
+                            eval_prefill_string("</slice>");
                         }
                         // V2.6 格式在 slices 后添加换行
-                        eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("\n");
                     }
                     
                     print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", 
@@ -5170,12 +5269,14 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     if (has_audio) {
                         if (!ctx_omni->duplex_mode) {
                             // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+                            eval_prefill_string("<|audio_start|>");
                         }
-                        prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
-                                        params->n_batch, &ctx_omni->n_past);
+                        if (prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
+                                             params->n_batch, &ctx_omni->n_past)) {
+                            perf_prefill_embed_tokens += n_audio_tokens;
+                        }
                         if (!ctx_omni->duplex_mode) {
-                            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+                            eval_prefill_string("<|audio_end|>");
                         }
                     }
                 }
@@ -5187,19 +5288,21 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     // 🔧 [根据模式选择格式]
                     if (ctx_omni->duplex_mode) {
                         // 双工格式：<unit> + audio_embedding（无 audio_start/end）
-                        eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("<unit>");
                     } else {
                         // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                        eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("<|audio_start|>");
                     }
                     
                     // Prefill 音频 embedding
-                    prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
-                                    params->n_batch, &ctx_omni->n_past);
+                    if (prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
+                                         params->n_batch, &ctx_omni->n_past)) {
+                        perf_prefill_embed_tokens += n_audio_tokens;
+                    }
                     
                     // 单工格式需要 <|audio_end|>
                     if (!ctx_omni->duplex_mode) {
-                        eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+                        eval_prefill_string("<|audio_end|>");
                     }
                 }
                 
@@ -5214,7 +5317,18 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             }
             {
                 const double kv_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - kv_prefill_t0).count();
-                std::string detail = kv_prefill_detail + ",n_past_delta=" + std::to_string(ctx_omni->n_past - kv_prefill_start_n_past);
+                const long long n_past_delta = ctx_omni->n_past - kv_prefill_start_n_past;
+                long long perf_prefill_tokens = perf_prefill_text_tokens + perf_prefill_embed_tokens;
+                if (perf_prefill_tokens <= 0 && n_past_delta > 0) {
+                    perf_prefill_tokens = n_past_delta;
+                }
+                std::string detail = kv_prefill_detail +
+                                     ",tokens=" + std::to_string(perf_prefill_tokens) +
+                                     ",text_tokens=" + std::to_string(perf_prefill_text_tokens) +
+                                     ",embed_tokens=" + std::to_string(perf_prefill_embed_tokens) +
+                                     ",n_past_delta=" + std::to_string(n_past_delta) +
+                                     omni_perf_speed_detail(perf_prefill_tokens, kv_prefill_ms);
+                omni_perf_record_tokens(ctx_omni, "llm.prefill", perf_prefill_tokens, kv_prefill_ms);
                 omni_perf_mark(ctx_omni, "llm.prefill", "end", perf_chunk_index, kv_prefill_ms, detail.c_str());
             }
             
@@ -5379,7 +5493,8 @@ static bool generate_audio_tokens_local_simplex(
     int chunk_idx,
     std::vector<int32_t>& output_audio_tokens,
     const std::string& output_dir = "",
-    bool is_final_text_chunk = false  // 🔧 [与 Python 对齐] 是否是最后一个 text chunk
+    bool is_final_text_chunk = false,  // 🔧 [与 Python 对齐] 是否是最后一个 text chunk
+    int * compute_tokens_out = nullptr
 ) {
     print_with_timestamp("TTS Simplex: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d)\n",
                         chunk_idx, n_tokens, tts_n_embd);
@@ -5483,6 +5598,7 @@ static bool generate_audio_tokens_local_simplex(
     print_with_timestamp("TTS Simplex: sampler created\n");
     
     output_audio_tokens.clear();
+    int compute_tokens = 0;
     
     // 🔧 [与 Python 对齐] 统一使用 tts_token_buffer 管理，和 Python _token_buffer 一致
     // Python chunk_size=25，每凑够 25 个才 yield
@@ -5524,6 +5640,7 @@ static bool generate_audio_tokens_local_simplex(
             LOG_ERR("TTS Simplex: sample_tts_token failed at step %d\n", t);
             break;
         }
+        compute_tokens++;
         
         int relative_idx = sampled_token_abs - audio_bos_token_id;
         if (relative_idx < 0 || relative_idx >= num_audio_tokens) {
@@ -5627,6 +5744,7 @@ static bool generate_audio_tokens_local_simplex(
                     LOG_ERR("TTS Simplex Phase2: sample failed at step %d\n", t2);
                     break;
                 }
+                compute_tokens++;
                 
                 int relative_idx = sampled_token_abs - audio_bos_token_id;
                 if (relative_idx < 0 || relative_idx >= num_audio_tokens) {
@@ -5748,6 +5866,9 @@ static bool generate_audio_tokens_local_simplex(
             fclose(f);
         }
     }
+    if (compute_tokens_out != nullptr) {
+        *compute_tokens_out = compute_tokens;
+    }
     
     return !output_audio_tokens.empty();
 }
@@ -5766,7 +5887,8 @@ static bool generate_audio_tokens_local(
     std::vector<int32_t>& output_audio_tokens,
     bool is_end_of_turn = false,  // 🔧 [与 Python 对齐] 是否是轮次结束
     const std::string& output_dir = "",
-    int perf_chunk_index = -1
+    int perf_chunk_index = -1,
+    int * compute_tokens_out = nullptr
 ) {
     print_with_timestamp("TTS Local: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d, emb_size=%zu)\n", 
                          chunk_idx, n_tokens, tts_n_embd, merged_embeddings.size());
@@ -5921,6 +6043,7 @@ static bool generate_audio_tokens_local(
     
     // 3. Generate audio tokens with streaming to T2W queue
     output_audio_tokens.clear();
+    int compute_tokens = 0;
     // Python: self.all_generated_tokens 是类成员变量，跨 chunk 持续累积
     // 用于：1. 正确判断是否是整个生成过程的第一个 token（re-forward condition）
     
@@ -5975,6 +6098,7 @@ static bool generate_audio_tokens_local(
             LOG_ERR("TTS Local: sample_tts_token failed at step %d\n", t);
             break;
         }
+        compute_tokens++;
         
         // Convert to relative index and check EOS
         int relative_idx = sampled_token_abs - audio_bos_token_id;
@@ -6088,6 +6212,9 @@ static bool generate_audio_tokens_local(
             fwrite(output_audio_tokens.data(), sizeof(int32_t), output_audio_tokens.size(), f);
             fclose(f);
         }
+    }
+    if (compute_tokens_out != nullptr) {
+        *compute_tokens_out = compute_tokens;
     }
     
     return !output_audio_tokens.empty();
@@ -6686,6 +6813,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 int tts_filtered_llm_tokens = 0;
                 int tts_condition_tokens = 0;
                 int tts_audio_tokens_generated = 0;
+                int tts_compute_tokens = 0;
                 bool tts_flush_only = false;
 
                 // Filter special tokens
@@ -6698,9 +6826,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 if (n_tokens_filtered <= 0) {
                     tts_infer_detail = "tts_chunk=" + std::to_string(current_chunk_idx) +
                                        ",llm_tokens=" + std::to_string(current_chunk_token_ids.size()) +
-                                       ",filtered_llm_tokens=0,condition_tokens=0,audio_tokens_generated=0" +
+                                       ",filtered_llm_tokens=0,condition_tokens=0,compute_tokens=0,audio_tokens_generated=0" +
+                                       ",tokens=0" +
                                        ",is_end_of_turn=" + std::to_string(accumulated_is_end_of_turn ? 1 : 0);
                     tts_infer_scope.set_detail(tts_infer_detail);
+                    tts_infer_scope.set_tokens(0);
                     continue;
                 }
 
@@ -6852,7 +6982,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, merged_embeddings,
                                                     n_tokens_filtered, tts_n_embd, current_chunk_idx,
                                                     audio_tokens_out, is_end_of_turn, tts_wav_output_dir,
-                                                    current_perf_chunk_index);
+                                                    current_perf_chunk_index, &tts_compute_tokens);
                     tts_condition_tokens = n_tokens_filtered + 1 + (is_end_of_turn ? 1 : 0);
                     tts_audio_tokens_generated = (int) audio_tokens_out.size();
 
@@ -6868,10 +6998,14 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                                    ",llm_tokens=" + std::to_string(current_chunk_token_ids.size()) +
                                    ",filtered_llm_tokens=" + std::to_string(tts_filtered_llm_tokens) +
                                    ",condition_tokens=" + std::to_string(tts_condition_tokens) +
+                                   ",compute_tokens=" + std::to_string(tts_compute_tokens) +
                                    ",audio_tokens_generated=" + std::to_string(tts_audio_tokens_generated) +
+                                   ",tokens=" + std::to_string(tts_compute_tokens) +
+                                   ",output_tokens=" + std::to_string(tts_audio_tokens_generated) +
                                    ",is_end_of_turn=" + std::to_string(accumulated_is_end_of_turn ? 1 : 0) +
                                    ",flush_only=" + std::to_string(tts_flush_only ? 1 : 0);
                 tts_infer_scope.set_detail(tts_infer_detail);
+                tts_infer_scope.set_tokens(tts_compute_tokens);
             }
             
             ++chunk_idx;
@@ -6945,20 +7079,25 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 std::vector<float> empty_embeddings;
                 std::vector<int32_t> audio_tokens_out;
                 int n_tokens_for_tts = 0;
+                int tts_compute_tokens = 0;
                 int current_chunk_idx = chunk_idx;
                 std::string tts_infer_detail = "tts_chunk=" + std::to_string(current_chunk_idx) +
-                                               ",llm_tokens=0,filtered_llm_tokens=0,condition_tokens=0,audio_tokens_generated=0,is_end_of_turn=1,flush_only=1";
+                                               ",llm_tokens=0,filtered_llm_tokens=0,condition_tokens=0,compute_tokens=0,audio_tokens_generated=0,is_end_of_turn=1,flush_only=1";
                 OmniPerfScope tts_infer_scope(ctx_omni, "tts.infer", current_perf_chunk_index, tts_infer_detail);
                 
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, empty_embeddings,
                                                 n_tokens_for_tts, tts_n_embd, current_chunk_idx,
                                                 audio_tokens_out, true, tts_wav_output_dir,
-                                                current_perf_chunk_index);
+                                                current_perf_chunk_index, &tts_compute_tokens);
                 tts_infer_detail = "tts_chunk=" + std::to_string(current_chunk_idx) +
                                    ",llm_tokens=0,filtered_llm_tokens=0,condition_tokens=2" +
+                                   ",compute_tokens=" + std::to_string(tts_compute_tokens) +
                                    ",audio_tokens_generated=" + std::to_string(audio_tokens_out.size()) +
+                                   ",tokens=" + std::to_string(tts_compute_tokens) +
+                                   ",output_tokens=" + std::to_string(audio_tokens_out.size()) +
                                    ",is_end_of_turn=1,flush_only=1";
                 tts_infer_scope.set_detail(tts_infer_detail);
+                tts_infer_scope.set_tokens(tts_compute_tokens);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -10259,6 +10398,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // 🔧 [P0-打断检测] 双工模式下记录当前 chunk 生成的 token 数
     int current_chunk_tokens = 0;
     int perf_decode_total_tokens = 0;
+    int perf_decode_compute_tokens = 0;
     int perf_decode_valid_tts_tokens = 0;
     auto llm_sample_t0 = std::chrono::steady_clock::now();
     omni_perf_mark(ctx_omni, "api.llm_decode_loop", "start", perf_chunk_index, -1.0, nullptr);
@@ -10279,6 +10419,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         
         int jl = 0;  // 计数有效的 TTS token 数量
         int total_tokens_generated = 0;  // 计数总共生成的 token 数量（包括被过滤的）
+        int manual_control_tokens = 0;   // 手动 feed 进 LLM KV 的控制 token，同样消耗推理
         // 收集当前chunk的token IDs和hidden states用于TTS条件生成
         // 🔧 [优化] 只收集有效的 TTS token，确保每次给 TTS 的都是 step_size 个有效 token
         std::vector<llama_token> chunk_token_ids;
@@ -10474,8 +10615,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
                 // Feed chunk_eos token to model (update KV cache)
                 std::vector<llama_token> chunk_eos_tokens = {ctx_omni->special_token_chunk_eos};
-                eval_tokens(ctx_omni, ctx_omni->params, chunk_eos_tokens, 
-                           ctx_omni->params->n_batch, &ctx_omni->n_past);
+                if (eval_tokens(ctx_omni, ctx_omni->params, chunk_eos_tokens,
+                                ctx_omni->params->n_batch, &ctx_omni->n_past)) {
+                    manual_control_tokens += (int) chunk_eos_tokens.size();
+                }
             }
             // 这样 SSE 流会结束，客户端可以再次调用 decode
             llm_finish = true;
@@ -10488,14 +10631,21 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
             // Feed </unit> token to model (update KV cache)
             std::vector<llama_token> unit_end_tokens = {ctx_omni->special_token_unit_end};
-            eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens, 
-                       ctx_omni->params->n_batch, &ctx_omni->n_past);
+            if (eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens,
+                            ctx_omni->params->n_batch, &ctx_omni->n_past)) {
+                manual_control_tokens += (int) unit_end_tokens.size();
+            }
         }
         {
             double llm_infer_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - llm_infer_t0).count();
-            std::string detail = "tokens=" + std::to_string(total_tokens_generated) +
+            const int compute_tokens = total_tokens_generated + manual_control_tokens;
+            std::string detail = "tokens=" + std::to_string(compute_tokens) +
+                                 ",sampled_tokens=" + std::to_string(total_tokens_generated) +
+                                 ",control_tokens=" + std::to_string(manual_control_tokens) +
                                  ",valid_tts_tokens=" + std::to_string(chunk_token_ids.size()) +
-                                 ",n_past_delta=" + std::to_string(ctx_omni->n_past - llm_infer_start_n_past);
+                                 ",n_past_delta=" + std::to_string(ctx_omni->n_past - llm_infer_start_n_past) +
+                                 omni_perf_speed_detail(compute_tokens, llm_infer_ms);
+            omni_perf_record_tokens(ctx_omni, "llm.decode", compute_tokens, llm_infer_ms);
             omni_perf_mark(ctx_omni, "llm.decode", "end", perf_chunk_index, llm_infer_ms, detail.c_str());
         }
         fflush(stdout);
@@ -10510,6 +10660,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 🔧 使用总生成的 token 数量更新 il（用于和 max_tgt_len 比较）
         il += total_tokens_generated;
         perf_decode_total_tokens += total_tokens_generated;
+        perf_decode_compute_tokens += total_tokens_generated + manual_control_tokens;
         perf_decode_valid_tts_tokens += (int) chunk_token_ids.size();
         
         // 🔧 [统一处理] 移除响应中的所有特殊结束 token
@@ -10638,7 +10789,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
     {
         double llm_sample_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - llm_sample_t0).count();
-        std::string detail = "tokens=" + std::to_string(perf_decode_total_tokens) +
+        std::string detail = "tokens=" + std::to_string(perf_decode_compute_tokens) +
+                             ",sampled_tokens=" + std::to_string(perf_decode_total_tokens) +
                              ",valid_tts_tokens=" + std::to_string(perf_decode_valid_tts_tokens);
         omni_perf_mark(ctx_omni, "api.llm_decode_loop", "end", perf_chunk_index, llm_sample_ms, detail.c_str());
     }
