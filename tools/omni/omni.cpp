@@ -148,54 +148,6 @@ void omni_perf_mark(struct omni_context * ctx_omni,
                     double duration_ms,
                     const char * detail);
 
-struct omni_nvtx_scope {
-#ifdef GGML_USE_CUDA
-    using nvtx_push_fn = int (*)(const char *);
-    using nvtx_pop_fn = int (*)();
-
-    static nvtx_push_fn get_push() {
-        static nvtx_push_fn fn = []() -> nvtx_push_fn {
-            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
-            if (!h) {
-                return nullptr;
-            }
-            return reinterpret_cast<nvtx_push_fn>(dlsym(h, "nvtxRangePushA"));
-        }();
-        return fn;
-    }
-
-    static nvtx_pop_fn get_pop() {
-        static nvtx_pop_fn fn = []() -> nvtx_pop_fn {
-            void * h = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
-            if (!h) {
-                return nullptr;
-            }
-            return reinterpret_cast<nvtx_pop_fn>(dlsym(h, "nvtxRangePop"));
-        }();
-        return fn;
-    }
-
-    explicit omni_nvtx_scope(const char * name) : active(false) {
-        if (auto push = get_push()) {
-            push(name);
-            active = true;
-        }
-    }
-
-    ~omni_nvtx_scope() {
-        if (active) {
-            if (auto pop = get_pop()) {
-                pop();
-            }
-        }
-    }
-
-    bool active;
-#else
-    explicit omni_nvtx_scope(const char * /*name*/) {}
-#endif
-};
-
 // ==================== 特殊 Token 分类 ====================
 // 
 // 双工模式下，模型生成的特殊 token 分为以下几类：
@@ -357,13 +309,11 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (omni_embed->embed + i*n_embd);
-        std::vector<int8_t> logits_vec(n_eval, false);
         std::vector<llama_pos> pos_vec(n_eval);
         for (int j = 0; j < n_eval; j++) {
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
-        batch.logits = logits_vec.data();
         
         if (llama_decode(ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
@@ -375,7 +325,6 @@ bool omni_eval_embed(llama_context * ctx_llama, const struct omni_embed * omni_e
 }
 
 bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, float* embed, int n_pos, int n_batch, int*n_past) {
-    omni_nvtx_scope nvtx_prefill_total("omni.prefill_with_emb.total");
     kv_cache_slide_window(ctx_omni, params, n_pos);
     
     int n_embd  = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
@@ -387,15 +336,12 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
         llama_batch batch = {};
         batch.n_tokens = int32_t(n_eval);
         batch.embd     = (embed + i*n_embd);
-        std::vector<int8_t> logits_vec(n_eval, false);
         std::vector<llama_pos> pos_vec(n_eval);
         for (int j = 0; j < n_eval; j++) {
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
-        batch.logits = logits_vec.data();
         
-        omni_nvtx_scope nvtx_prefill_decode("omni.prefill_with_emb.llama_decode");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
@@ -944,7 +890,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
     print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
 }
 
-static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false, bool need_logits = true) {
+static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
     int N = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, N);
 
@@ -960,15 +906,10 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
         }
         // llama_batch_get_one 返回的 batch.pos 可能是 nullptr，需要手动设置
         llama_batch batch = llama_batch_get_one(&tokens[i], n_eval);
-        std::vector<int8_t> logits_vec;
         std::vector<llama_pos> pos_vec;
         if (batch.pos == nullptr) {
             pos_vec.resize(n_eval);
             batch.pos = pos_vec.data();
-        }
-        if (!need_logits) {
-            logits_vec.assign(n_eval, false);
-            batch.logits = logits_vec.data();
         }
         for (int j = 0; j < n_eval; j++) {
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
@@ -1064,10 +1005,10 @@ static bool eval_id_with_hidden(struct omni_context * ctx_omni, common_params* p
     return eval_tokens_with_hidden(ctx_omni, params, tokens, 1, n_past, hidden_states);
 }
 
-static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false, bool need_logits = true) {
+static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false) {
     std::string              str2     = str;
     std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
-    return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb, need_logits);
+    return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb);
 }
 
 static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, float *& hidden_states) {
@@ -4836,52 +4777,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     // ==================== 初始化特殊 Token ID ====================
     // 从 LLM 词表中查找并缓存特殊 token ID
     // 这些 token 用于控制双工模式下的状态切换
-    
-    const struct llama_vocab * vocab = llama_model_get_vocab(model);
-    if (vocab) {
-        // 使用 llama_tokenize 直接将字符串转换为 token ID
-        // parse_special=true 确保特殊 token 被正确解析
-        auto find_token = [&](const char * token_str) -> llama_token {
-            llama_token tokens[4];  // 预留空间
-            int n_tokens = llama_tokenize(vocab, token_str, strlen(token_str), tokens, 4, false, true);
-            if (n_tokens == 1) {
-                return tokens[0];
-            }
-            // 如果 tokenize 失败，尝试遍历词表查找（使用 special=true）
-            int n_vocab = llama_vocab_n_tokens(vocab);
-            for (int i = 0; i < n_vocab; i++) {
-                char buf[128];
-                int len = llama_token_to_piece(vocab, i, buf, sizeof(buf), 0, true);  // special=true
-                if (len > 0 && len < (int)sizeof(buf)) {
-                    buf[len] = '\0';
-                    if (strcmp(buf, token_str) == 0) {
-                        return i;
-                    }
-                }
-            }
-            return -1;
-        };
-        
-        ctx_omni->special_token_speak = find_token("<|speak|>");
-        ctx_omni->special_token_listen = find_token("<|listen|>");
-        ctx_omni->special_token_chunk_eos = find_token("<|chunk_eos|>");
-        ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
-        ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
-        ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
-        ctx_omni->special_token_eos = llama_vocab_eos(vocab);
-        
-        // 同时初始化 tts_bos_token_id（用于双工模式强制继续说话）
-        llama_token tts_bos = find_token("<|tts_bos|>");
-        if (tts_bos >= 0) {
-            ctx_omni->tts_bos_token_id = tts_bos;
-        }
-        // 初始化 </unit> token（用于双工模式 chunk 边界标记）
-        ctx_omni->special_token_unit_end = find_token("</unit>");
-        
-        // 🔧 [双工模式] 初始化 <|tts_pad|> token（双工模式下禁止采样此 token）
-        // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
-        ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
-    }
+    omni_init_special_tokens(ctx_omni, model);
         
     // Optional GPU utilization sampler uses the same steady-clock base as DUPLEX_PERF.
     omni_gpu_perf_sampler_start();
@@ -9828,10 +9724,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // 双工模式：参考音频需要送入 LLM
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            {
-                omni_nvtx_scope nvtx_prefill_text_prefix("omni.stream_prefill.system_prompt.text_prefix");
-                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
-            }
+            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
             auto audio_encode_t0 = std::chrono::steady_clock::now();
@@ -9854,10 +9747,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             }
             
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            {
-                omni_nvtx_scope nvtx_prefill_text_suffix("omni.stream_prefill.system_prompt.text_suffix");
-                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
-            }
+            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         } else {
             // 🔧 [与 Python 对齐] 非双工模式也需要在 system prompt 中插入 ref_audio embedding
             // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
@@ -9872,10 +9762,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            {
-                omni_nvtx_scope nvtx_prefill_text_prefix("omni.stream_prefill.system_prompt.text_prefix");
-                eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
-            }
+            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
             
             // Step 2: 获取并 prefill 参考音频的 APM embedding
             auto ref_encode_t0 = std::chrono::steady_clock::now();
@@ -9904,10 +9791,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             }
             
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            {
-                omni_nvtx_scope nvtx_prefill_text_suffix("omni.stream_prefill.system_prompt.text_suffix");
-                eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false, false, false);
-            }
+            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         }
         
         // 标记系统 prompt 已初始化
@@ -11007,8 +10891,6 @@ bool omni_text_infer_once(struct omni_context * ctx_omni,
 
     const std::string prompt = "<|im_start|>user\n" + user_prompt + "<|im_end|>\n<|im_start|>assistant\n";
     {
-        omni_nvtx_scope nvtx_text_prefill_total("omni.text_prefill.total");
-        omni_nvtx_scope nvtx_text_prefill_eval("omni.text_prefill.eval_string");
         if (eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false) == false) {
             LOG_ERR("%s: failed to eval text prompt\n", __func__);
             return false;
