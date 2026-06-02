@@ -22,6 +22,12 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
 };
 
+enum llama_quantization_method {
+    LLAMA_QUANTIZATION_METHOD_NONE = 0,
+    LLAMA_QUANTIZATION_METHOD_GPTQ = 1,
+    LLAMA_QUANTIZATION_METHOD_AWQ  = 2,
+};
+
 struct llama_hparams_posnet {
     uint32_t n_embd;
     uint32_t n_layer;
@@ -59,6 +65,16 @@ struct llama_hparams {
     struct llama_hparams_convnext convnext;
 
     uint32_t n_shortconv_l_cache  = 0;
+    llama_quantization_method quant_method = LLAMA_QUANTIZATION_METHOD_NONE;
+    uint32_t quant_bits           = 0;
+    uint32_t quant_group_size     = 0;
+    float quant_damp_percent      = 0.0f;
+    bool quant_zero_point         = false;
+    bool quant_desc_act           = false;
+    bool quant_static_groups      = false;
+    bool quant_sym                = false;
+    bool quant_true_sequential    = false;
+    std::array<char, 32> quant_checkpoint_format = {};
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
@@ -135,7 +151,6 @@ struct llama_hparams {
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 
     bool ssm_dt_b_c_rms = false;
-
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
@@ -262,4 +277,3 @@ struct llama_hparams {
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
-

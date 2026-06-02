@@ -74,6 +74,7 @@ struct T2WOut {
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
+    int perf_chunk_index = -1;  // 性能日志归属的输入 chunk，随队列数据传递避免异步错归属
 };
 
 struct T2WThreadInfo {
@@ -142,6 +143,12 @@ struct projector_model {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_type_t buf_type = nullptr;
     bool initialized = false;
+};
+
+struct OmniPerfTokenStats {
+    long long calls = 0;
+    long long tokens = 0;
+    double duration_ms = 0.0;
 };
 
 struct omni_context {
@@ -399,6 +406,11 @@ struct omni_context {
     
     // Timestamp for stream_decode start (used for WAV file naming)
     std::chrono::high_resolution_clock::time_point stream_decode_start_time;
+    std::atomic<int> perf_current_chunk_index{-1};
+    std::mutex perf_token_stats_mtx;
+    OmniPerfTokenStats perf_llm_prefill;
+    OmniPerfTokenStats perf_llm_decode;
+    OmniPerfTokenStats perf_tts_infer;
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
@@ -469,6 +481,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
                                 const std::string & base_output_dir = "./tools/omni/output");
+
+struct omni_context * omni_init_text_only(struct common_params * params,
+                                          const std::string & base_output_dir = "./tools/omni/output");
+
+void omni_perf_mark(struct omni_context * ctx_omni,
+                    const char * stage,
+                    const char * event,
+                    int chunk_index = -1,
+                    double duration_ms = -1.0,
+                    const char * detail = nullptr);
 
 void omni_free(struct omni_context * ctx_omni);
 
@@ -569,6 +591,11 @@ bool omni_duplex_drain_tts_audio(struct omni_context * ctx_omni,
 bool stop_speek(struct omni_context * ctx_omni);
 
 bool clean_kvcache(struct omni_context * ctx_omni);
+
+bool omni_text_infer_once(struct omni_context * ctx_omni,
+                          const std::string & user_prompt,
+                          std::string & response,
+                          bool print_output = true);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);

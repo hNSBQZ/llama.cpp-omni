@@ -66,6 +66,7 @@ static void show_usage(const char * prog_name) {
         "  --vision-backend <mode>  Vision compute backend: 'metal' (default) or 'coreml' (ANE)\n"
         "  --vision-coreml <path>   Path to CoreML model (.mlmodelc), required when backend=coreml\n"
         "  --test <prefix> <n> Run test case with data prefix and count\n"
+        "  --text-prompt <txt> Run one text-only inference with the given prompt and exit\n"
         "  -h, --help          Show this help message\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf\n"
@@ -127,6 +128,12 @@ static bool file_exists(const std::string & path) {
         return true;
     }
     return false;
+}
+
+static std::string make_run_output_dir() {
+    const auto now = std::chrono::system_clock::now();
+    const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return std::string("./tools/omni/output_runs/run_") + std::to_string(ts_ms);
 }
 
 static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
@@ -207,6 +214,7 @@ int main(int argc, char ** argv) {
     std::string vision_backend = "metal";  // vision backend: "metal" (default) or "coreml"
     std::string vision_coreml_model_path;  // CoreML model path (required when vision_backend=coreml)
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
+    std::string base_output_dir = make_run_output_dir();
     int n_ctx = 4096;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
     int media_type = 1;     // 1=audio only, 2=omni (audio+vision)
@@ -214,6 +222,7 @@ int main(int argc, char ** argv) {
     bool run_test = false;
     std::string test_audio_prefix;
     int test_count = 0;
+    std::string text_prompt;
     
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -268,6 +277,9 @@ int main(int argc, char ** argv) {
             test_audio_prefix = argv[++i];
             test_count = std::atoi(argv[++i]);
         }
+        else if (arg == "--text-prompt" && i + 1 < argc) {
+            text_prompt = argv[++i];
+        }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             show_usage(argv[0]);
@@ -282,6 +294,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     
+    if (!text_prompt.empty()) {
+        use_tts = false;
+    }
+
     // 解析模型路径
     OmniModelPaths paths = resolve_model_paths(llm_path);
     
@@ -299,7 +315,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: LLM model not found: %s\n", paths.llm.c_str());
         return 1;
     }
-    if (!file_exists(paths.audio)) {
+    if (text_prompt.empty() && !file_exists(paths.audio)) {
         fprintf(stderr, "Error: Audio model not found: %s\n", paths.audio.c_str());
         return 1;
     }
@@ -335,7 +351,11 @@ int main(int argc, char ** argv) {
     common_init();
     
     printf("=== Initializing Omni Context ===\n");
-    printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
+    if (!text_prompt.empty()) {
+        printf("  Mode: text-only\n");
+    } else {
+        printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
+    }
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
     printf("  Context size: %d\n", n_ctx);
     printf("  GPU layers: %d\n", n_gpu_layers);
@@ -343,19 +363,46 @@ int main(int argc, char ** argv) {
     if (vision_backend == "coreml") {
         printf("  Vision CoreML: %s\n", vision_coreml_model_path.c_str());
     }
-    printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
-    printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    if (!text_prompt.empty()) {
+        printf("  Text prompt: %s\n", text_prompt.c_str());
+    } else {
+        printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
+        printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    }
     
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
-    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
+    printf("=== Output Directory ===\n");
+    printf("  Base output dir: %s\n", base_output_dir.c_str());
+    printf("========================\n");
+
+    struct omni_context * ctx_omni = nullptr;
+    if (!text_prompt.empty()) {
+        ctx_omni = omni_init_text_only(&params, base_output_dir);
+    } else {
+        ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0", false, nullptr, nullptr, base_output_dir);
+    }
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;
     }
-    ctx_omni->async = true;
+    ctx_omni->async = text_prompt.empty();
     ctx_omni->ref_audio_path = ref_audio_path;  // 设置参考音频路径
 
-    if (run_test) {
+    if (!text_prompt.empty()) {
+        printf("=== Running text-only one-shot inference ===\n");
+        printf("  Prompt: %s\n", text_prompt.c_str());
+        ctx_omni->async = false;
+        ctx_omni->use_tts = false;
+        if (params.n_predict < 0) {
+            params.n_predict = 256;
+        }
+        std::string text_response;
+        if (!omni_text_infer_once(ctx_omni, text_prompt, text_response, true)) {
+            fprintf(stderr, "Error: text-only inference failed\n");
+            omni_free(ctx_omni);
+            return 1;
+        }
+    } else if (run_test) {
         printf("=== Running test case ===\n");
         printf("  Audio prefix: %s\n", test_audio_prefix.c_str());
         printf("  Count: %d\n", test_count);

@@ -7,9 +7,11 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <stdexcept>
 
 //
@@ -55,6 +57,7 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1466,6 +1469,7 @@ ggml_status llama_context::graph_compute(
 
     return status;
 }
+
 
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {

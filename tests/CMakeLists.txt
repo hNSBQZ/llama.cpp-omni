@@ -203,6 +203,13 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    llama_build(test-marlin-w4a16.cpp)
+    target_link_libraries(test-marlin-w4a16 PRIVATE ggml-cuda CUDA::cudart)
+    llama_test(test-marlin-w4a16 LABEL "main;cuda")
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
