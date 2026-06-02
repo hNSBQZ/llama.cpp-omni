@@ -38,6 +38,12 @@ GPU_STATUS_RE = re.compile(
     r'\[DUPLEX_GPU\] event=(?P<event>\S+) reason="(?P<reason>[^"]*)"'
 )
 CHUNK_RE = re.compile(r"prefill:\s*([0-9.]+) s \| decode:\s*([0-9.]+) s \| total:\s*([0-9.]+) s \| n_past:\s*(\d+)")
+OPT4_CHUNK_RE = re.compile(
+    r"--- Chunk (?P<seq>\d+)/(?P<count>\d+) --- "
+    r"prefill (?P<prefill_ms>[0-9.]+)ms \| decode (?P<decode_ms>[0-9.]+)ms \| "
+    r"e2e (?P<e2e_ms>[0-9.]+)ms \| n_past (?P<n_past>\d+) \| "
+    r"<\|(?P<decision>speak|listen)\|>(?: \"(?P<text>[^\"]*)\")?"
+)
 DECISION_RE = re.compile(r"决策:\s*<\|(speak|listen)\|>(?:\s*→\s*\"([^\"]*)\")?")
 
 STAGE_ROWS = [
@@ -170,20 +176,32 @@ def parse_log(path: Path, gpu_log_path=None):
             "reason": group["reason"],
         })
 
-    decisions = list(DECISION_RE.finditer(text))
     chunks = []
-    for idx, match in enumerate(CHUNK_RE.finditer(text)):
-        decision = decisions[idx].group(1) if idx < len(decisions) else ""
-        decision_text = decisions[idx].group(2) if idx < len(decisions) and decisions[idx].group(2) else ""
+    for match in OPT4_CHUNK_RE.finditer(text):
+        group = match.groupdict()
         chunks.append({
-            "chunk": idx,
-            "prefill_ms": float(match.group(1)) * 1000.0,
-            "decode_ms": float(match.group(2)) * 1000.0,
-            "total_ms": float(match.group(3)) * 1000.0,
-            "n_past": int(match.group(4)),
-            "decision": decision,
-            "text": decision_text,
+            "chunk": int(group["seq"]),
+            "prefill_ms": float(group["prefill_ms"]),
+            "decode_ms": float(group["decode_ms"]),
+            "total_ms": float(group["e2e_ms"]),
+            "n_past": int(group["n_past"]),
+            "decision": group["decision"],
+            "text": group["text"] or "",
         })
+    if not chunks:
+        decisions = list(DECISION_RE.finditer(text))
+        for idx, match in enumerate(CHUNK_RE.finditer(text)):
+            decision = decisions[idx].group(1) if idx < len(decisions) else ""
+            decision_text = decisions[idx].group(2) if idx < len(decisions) and decisions[idx].group(2) else ""
+            chunks.append({
+                "chunk": idx,
+                "prefill_ms": float(match.group(1)) * 1000.0,
+                "decode_ms": float(match.group(2)) * 1000.0,
+                "total_ms": float(match.group(3)) * 1000.0,
+                "n_past": int(match.group(4)),
+                "decision": decision,
+                "text": decision_text,
+            })
     return text, events, chunks, gpu_samples, gpu_statuses
 
 
@@ -476,7 +494,7 @@ def chunk_latency_svg(path: Path, chunks):
     write(path, svg_base(width, height, body))
 
 
-def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
+def overlap_svg(path: Path, events, start_ms=None, end_ms=None):
     width, height = 1180, 530
     left, top, chart_w = 210, 86, 900
     lanes = [
@@ -493,18 +511,9 @@ def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
         "queue.t2w.enqueue":"#9ecae9", "queue.t2w.wait_data":"#c6dbef", "t2w.infer":"#3182bd", "t2w.write":"#9e9ac8",
     }
     stage_lane = {stage: lane for lane, stages in lanes for stage in stages}
-    lane_y = {}
-    body = ['<rect width="1180" height="530" fill="#ffffff"/>', '<text x="40" y="42" class="title">异步重叠时间线：约 0.85s 到 1.40s</text>', '<text x="40" y="66" class="subtitle">TTS/T2W 与下一轮 prefill/decode 同时运行；chunk 标签按日志原值显示</text>']
-    for tick in range(int(start_ms), int(end_ms) + 1, 50):
-        x = left + (tick - start_ms) / (end_ms - start_ms) * chart_w
-        body += [f'<line x1="{x:.1f}" y1="80" x2="{x:.1f}" y2="455" stroke="#edf1f7"/>', f'<text x="{x - 14:.1f}" y="478" class="tiny">{tick}</text>']
-    for idx, (lane, _) in enumerate(lanes):
-        y = top + idx * 92
-        lane_y[lane] = y
-        body += [f'<rect x="40" y="{y - 20}" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>', f'<text x="58" y="{y + 5}" class="label" font-weight="700">{esc(lane)}</text>']
     starts = defaultdict(list)
     bars = []
-    for event in sorted(events, key=lambda item: item["t_ms"]):
+    for event in sorted(events, key=lambda item: (item["t_ms"], item.get("seq", -1))):
         key = (event["stage"], event["chunk"])
         if event["event"] == "start":
             starts[key].append(event)
@@ -512,10 +521,41 @@ def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
             start = starts[key].pop(0) if starts[key] else None
             begin = start["t_ms"] if start else event["t_ms"] - max(event["dur_ms"], 0)
             finish = event["t_ms"]
-            if finish >= start_ms and begin <= end_ms:
-                bars.append((begin, finish, event["stage"], event["chunk"]))
+            bars.append((begin, finish, event["stage"], event["chunk"]))
+
+    if bars and (start_ms is None or end_ms is None):
+        window_ms = 550.0
+        candidates = sorted({begin for begin, _, _, _ in bars})
+        best_start = candidates[0]
+        best_score = -1.0
+        for candidate in candidates:
+            candidate_end = candidate + window_ms
+            score = sum(max(0.0, min(finish, candidate_end) - max(begin, candidate))
+                        for begin, finish, _, _ in bars)
+            if score > best_score:
+                best_score = score
+                best_start = candidate
+        start_ms = max(0.0, best_start - 10.0)
+        end_ms = start_ms + window_ms
+    elif start_ms is None or end_ms is None:
+        start_ms, end_ms = 0.0, 550.0
+
+    lane_y = {}
+    title = f"异步重叠时间线：约 {start_ms / 1000.0:.2f}s 到 {end_ms / 1000.0:.2f}s"
+    body = ['<rect width="1180" height="530" fill="#ffffff"/>',
+            f'<text x="40" y="42" class="title">{esc(title)}</text>',
+            '<text x="40" y="66" class="subtitle">TTS/T2W 与下一轮 prefill/decode 同时运行；chunk 标签按日志原值显示</text>']
+    for tick in range(int(start_ms), int(end_ms) + 1, 50):
+        x = left + (tick - start_ms) / (end_ms - start_ms) * chart_w
+        body += [f'<line x1="{x:.1f}" y1="80" x2="{x:.1f}" y2="455" stroke="#edf1f7"/>', f'<text x="{x - 14:.1f}" y="478" class="tiny">{tick}</text>']
+    for idx, (lane, _) in enumerate(lanes):
+        y = top + idx * 92
+        lane_y[lane] = y
+        body += [f'<rect x="40" y="{y - 20}" width="1070" height="62" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>', f'<text x="58" y="{y + 5}" class="label" font-weight="700">{esc(lane)}</text>']
     offsets = {stage: (i % 3) * 16 for i, stage in enumerate(colors)}
     for begin, finish, stage, chunk in bars:
+        if finish < start_ms or begin > end_ms:
+            continue
         lane = stage_lane[stage]
         x = left + (max(begin, start_ms) - start_ms) / (end_ms - start_ms) * chart_w
         w = max(2, (min(finish, end_ms) - max(begin, start_ms)) / (end_ms - start_ms) * chart_w)

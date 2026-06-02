@@ -3685,6 +3685,7 @@ struct DuplexPrefillPacket {
 struct DuplexDecodeReq {
     std::string        debug_dir;
     int                round_idx = -1;
+    int                perf_chunk_index = -1;
     std::atomic<bool>  done{false};
     std::atomic<bool>  ok{false};
 };
@@ -9854,37 +9855,50 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- VPM 任务 ----
         auto vpm_task = [&]() -> double {
             if (!has_img) return 0.0;
-            auto t0 = std::chrono::high_resolution_clock::now();
-            if (!omni_image_embed_make_chunks_with_filename(
+            auto t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "vision.encode", "start", req->index, -1.0, req->img_fname.c_str());
+            bool ok = omni_image_embed_make_chunks_with_filename(
                     ctx_omni->ctx_vision,
                     params->cpuparams.n_threads,
                     req->img_fname,
-                    packet->vision_embed)) {
+                    packet->vision_embed);
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!ok) {
                 LOG_ERR("Duplex encoder: vision encode failed for %s\n",
                         req->img_fname.c_str());
                 packet->vision_embed.clear();
+                omni_perf_mark(ctx_omni, "vision.encode", "end", req->index, ms, "mode=duplex_encoder,ok=0");
+            } else {
+                std::string detail = "mode=duplex_encoder,ok=1,chunks=" + std::to_string(packet->vision_embed.size());
+                omni_perf_mark(ctx_omni, "vision.encode", "end", req->index, ms, detail.c_str());
             }
-            auto t1 = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return ms;
         };
 
         // ---- APM 任务 ----
         auto apm_task = [&]() -> double {
             if (!has_aud) return 0.0;
-            auto t0 = std::chrono::high_resolution_clock::now();
+            auto t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "audio.encode", "start", req->index, -1.0, req->aud_fname.c_str());
             auto * audio_embeds = omni_audio_embed_make_with_filename(
                 ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
+            int n_pos = audio_embeds ? audio_embeds->n_pos : 0;
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
                 packet->audio_embed.resize(audio_embeds->n_pos * hidden_size);
                 std::memcpy(packet->audio_embed.data(), audio_embeds->embed,
                             packet->audio_embed.size() * sizeof(float));
-                omni_embed_free(audio_embeds);
             } else {
                 LOG_WRN("Duplex encoder: audio encode returned empty for %s\n",
                         req->aud_fname.c_str());
             }
-            auto t1 = std::chrono::high_resolution_clock::now();
-            return std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (audio_embeds != nullptr) {
+                omni_embed_free(audio_embeds);
+            }
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::string detail = "mode=duplex_encoder,ok=" + std::to_string(n_pos > 0 ? 1 : 0) +
+                                 ",n_pos=" + std::to_string(n_pos);
+            omni_perf_mark(ctx_omni, "audio.encode", "end", req->index, ms, detail.c_str());
+            return ms;
         };
 
         double vpm_ms = 0.0, apm_ms = 0.0;
@@ -9907,22 +9921,32 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             req->index, vpm_ms, apm_ms, enc_wall_ms,
             (vpm_ms + apm_ms) - enc_wall_ms);
 
-        delete req;
-
         // ---- push to llm prefill_queue ----
+        std::string llm_queue_detail = "mode=duplex_encoder,audio_values=" + std::to_string(packet->audio_embed.size()) +
+                                       ",vision_chunks=" + std::to_string(packet->vision_embed.size());
+        auto wait_space_t0 = std::chrono::steady_clock::now();
+        omni_perf_mark(ctx_omni, "queue.llm.wait_space", "start", req->index, -1.0, llm_queue_detail.c_str());
         {
             std::unique_lock<std::mutex> lk(dup->llm_mtx);
             dup->llm_cv.wait(lk, [&]{
                 return dup->prefill_queue.size() < DuplexPipeline::PREFILL_QUEUE_CAP
                     || !dup->running.load();
             });
+            double wait_space_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_space_t0).count();
+            omni_perf_mark(ctx_omni, "queue.llm.wait_space", "end", req->index, wait_space_ms, llm_queue_detail.c_str());
             if (!dup->running.load()) {
                 delete packet;
+                delete req;
                 break;
             }
+            auto enqueue_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "queue.llm.enqueue", "start", req->index, -1.0, llm_queue_detail.c_str());
             dup->prefill_queue.push(packet);
+            double enqueue_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - enqueue_t0).count();
+            omni_perf_mark(ctx_omni, "queue.llm.enqueue", "end", req->index, enqueue_ms, llm_queue_detail.c_str());
         }
         dup->llm_cv.notify_all();
+        delete req;
     }
     print_with_timestamp("Duplex: encoder_thread stopped\n");
 }
@@ -10154,10 +10178,21 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
         return false;
     }
 
+    auto perf_t0 = std::chrono::steady_clock::now();
+    const int perf_start_n_past = ctx_omni->n_past;
+    std::string perf_detail = "mode=fused,tokens=" + std::to_string(fused_ntok) +
+                              ",audio_tokens=" + std::to_string(n_audio_tokens) +
+                              ",vision_chunks=" + std::to_string(packet->vision_embed.size());
+    omni_perf_mark(ctx_omni, "llm.prefill", "start", packet->index, -1.0, perf_detail.c_str());
+
     // One shot prefill: 77 tokens 远小于 n_batch(512)，实际只会 1 次 llama_decode。
     if (!prefill_with_emb(ctx_omni, params, fused.data(),
                           fused_ntok, params->n_batch, &ctx_omni->n_past)) {
         LOG_ERR("duplex_fused: prefill_with_emb failed\n");
+        double fail_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_t0).count();
+        std::string fail_detail = perf_detail + ",ok=0,n_past_delta=" +
+                                  std::to_string(ctx_omni->n_past - perf_start_n_past);
+        omni_perf_mark(ctx_omni, "llm.prefill", "end", packet->index, fail_ms, fail_detail.c_str());
         return false;
     }
 
@@ -10169,6 +10204,13 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t_end - t_begin).count();
+    double perf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_t0).count();
+    const long long n_past_delta = ctx_omni->n_past - perf_start_n_past;
+    std::string final_detail = perf_detail +
+                               ",ok=1,n_past_delta=" + std::to_string(n_past_delta) +
+                               omni_perf_speed_detail(fused_ntok, perf_ms);
+    omni_perf_record_tokens(ctx_omni, "llm.prefill", fused_ntok, perf_ms);
+    omni_perf_mark(ctx_omni, "llm.prefill", "end", packet->index, perf_ms, final_detail.c_str());
     print_with_timestamp(
         "[prof] llm prefill (fused) n_past=%d->%d tokens=%d ms=%.1f\n",
         n_past_0, ctx_omni->n_past,
@@ -10181,6 +10223,28 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
                                   int hidden_size) {
     auto t_begin   = std::chrono::high_resolution_clock::now();
     int  n_past_0  = ctx_omni->n_past;
+    const int perf_start_n_past = ctx_omni->n_past;
+    auto perf_t0 = std::chrono::steady_clock::now();
+    long long perf_text_tokens = 0;
+    long long perf_embed_tokens = 0;
+
+    auto eval_prefill_string = [&](const char * text) {
+        int n_text_tokens = 0;
+        bool ok = eval_string(ctx_omni, params, text, params->n_batch,
+                              &ctx_omni->n_past, false, false, &n_text_tokens);
+        if (ok) {
+            perf_text_tokens += n_text_tokens;
+        }
+        return ok;
+    };
+    auto prefill_packet_emb = [&](float * embed, int n_tokens) {
+        bool ok = prefill_with_emb(ctx_omni, params, embed, n_tokens,
+                                   params->n_batch, &ctx_omni->n_past);
+        if (ok) {
+            perf_embed_tokens += n_tokens;
+        }
+        return ok;
+    };
 
     // 单 packet 版本：语义上等价于原 batch.size()==1 的情况。
     // duplex 下 prefill/decode 必须严格 1-1 配对，否则 decode 的 KV 上下文会被
@@ -10195,6 +10259,9 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
             ? (int)(packet->audio_embed.size() / hidden_size) : 0;
         bool has_audio  = (n_audio_tokens > 0);
         bool has_vision = !packet->vision_embed.empty();
+        std::string perf_detail = "mode=fallback,audio_tokens=" + std::to_string(n_audio_tokens) +
+                                  ",vision_chunks=" + std::to_string(packet->vision_embed.size());
+        omni_perf_mark(ctx_omni, "llm.prefill", "start", packet->index, -1.0, perf_detail.c_str());
 
         if (has_vision) {
             int n_chunks         = (int)packet->vision_embed.size();
@@ -10202,36 +10269,26 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
             bool has_slices      = (n_chunks > 1);
 
             // duplex 格式：<unit><image>[overview]</image>(<slice>[slice]</slice>)*\n[audio]
-            eval_string(ctx_omni, params, "<unit><image>",
-                        params->n_batch, &ctx_omni->n_past, false);
-            prefill_with_emb(ctx_omni, params, packet->vision_embed[0].data(),
-                             tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
-            eval_string(ctx_omni, params, "</image>",
-                        params->n_batch, &ctx_omni->n_past, false);
+            eval_prefill_string("<unit><image>");
+            prefill_packet_emb(packet->vision_embed[0].data(), tokens_per_chunk);
+            eval_prefill_string("</image>");
             if (has_slices) {
                 for (int i = 1; i < n_chunks; i++) {
-                    eval_string(ctx_omni, params, "<slice>",
-                                params->n_batch, &ctx_omni->n_past, false);
-                    prefill_with_emb(ctx_omni, params, packet->vision_embed[i].data(),
-                                     tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, params, "</slice>",
-                                params->n_batch, &ctx_omni->n_past, false);
+                    eval_prefill_string("<slice>");
+                    prefill_packet_emb(packet->vision_embed[i].data(), tokens_per_chunk);
+                    eval_prefill_string("</slice>");
                 }
-                eval_string(ctx_omni, params, "\n",
-                            params->n_batch, &ctx_omni->n_past, false);
+                eval_prefill_string("\n");
             }
             if (has_audio) {
                 // duplex 下 audio 直接跟在 vision 后面（无 audio_start/end 标签）
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
-                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past);
+                prefill_packet_emb(packet->audio_embed.data(), n_audio_tokens);
             }
         } else {
             // 纯音频 unit
-            eval_string(ctx_omni, params, "<unit>",
-                        params->n_batch, &ctx_omni->n_past, false);
+            eval_prefill_string("<unit>");
             if (has_audio) {
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
-                                 n_audio_tokens, params->n_batch, &ctx_omni->n_past);
+                prefill_packet_emb(packet->audio_embed.data(), n_audio_tokens);
             }
         }
 
@@ -10247,6 +10304,19 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t_end - t_begin).count();
+    double perf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_t0).count();
+    const long long n_past_delta = ctx_omni->n_past - perf_start_n_past;
+    long long perf_tokens = perf_text_tokens + perf_embed_tokens;
+    if (perf_tokens <= 0 && n_past_delta > 0) {
+        perf_tokens = n_past_delta;
+    }
+    std::string final_detail = "mode=fallback,tokens=" + std::to_string(perf_tokens) +
+                               ",text_tokens=" + std::to_string(perf_text_tokens) +
+                               ",embed_tokens=" + std::to_string(perf_embed_tokens) +
+                               ",n_past_delta=" + std::to_string(n_past_delta) +
+                               omni_perf_speed_detail(perf_tokens, perf_ms);
+    omni_perf_record_tokens(ctx_omni, "llm.prefill", perf_tokens, perf_ms);
+    omni_perf_mark(ctx_omni, "llm.prefill", "end", packet->index, perf_ms, final_detail.c_str());
     print_with_timestamp(
         "[prof] llm prefill n_past=%d->%d tokens=%d ms=%.1f\n",
         n_past_0, ctx_omni->n_past,
@@ -10262,6 +10332,10 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 // ---------------------------------------------------------------------------
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                              const std::string & debug_dir, int round_idx) {
+    const int perf_chunk_index = round_idx >= 0
+        ? round_idx
+        : (ctx_omni ? ctx_omni->perf_current_chunk_index.load() : -1);
+
     // ---- 轮次同步（与老 stream_decode 对齐） ----
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
@@ -10301,9 +10375,17 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     // decode 开始时的 cache 长度（prefill 已完成写入，这里取值才准确）
     int decode_start_cache_len = ctx_omni->n_past;
+    auto llm_loop_t0 = std::chrono::steady_clock::now();
+    omni_perf_mark(ctx_omni, "api.llm_decode_loop", "start", perf_chunk_index, -1.0, "mode=duplex_pipeline");
+    bool llm_first_token_logged = false;
+    int perf_decode_total_tokens = 0;
+    int perf_decode_compute_tokens = 0;
+    int perf_decode_valid_tts_tokens = 0;
 
     // ---- force_listen：会话开局强制 LISTEN N 次 ----
     if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+        auto force_listen_t0 = std::chrono::steady_clock::now();
+        omni_perf_mark(ctx_omni, "control.force_listen", "start", perf_chunk_index, -1.0, nullptr);
         ctx_omni->force_listen_used++;
         ctx_omni->slide_last_was_listen = true;
         ctx_omni->ended_with_listen     = true;
@@ -10320,6 +10402,15 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
+        double force_listen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - force_listen_t0).count();
+        std::string control_detail = "used=" + std::to_string(ctx_omni->force_listen_used) +
+                                     ",count=" + std::to_string(ctx_omni->force_listen_count);
+        omni_perf_mark(ctx_omni, "control.force_listen", "end", perf_chunk_index, force_listen_ms, control_detail.c_str());
+        double loop_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - llm_loop_t0).count();
+        omni_perf_mark(ctx_omni, "api.llm_decode_loop", "end", perf_chunk_index, loop_ms,
+                       "tokens=0,sampled_tokens=0,valid_tts_tokens=0,force_listen=1");
         return true;
     }
 
@@ -10346,6 +10437,11 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         std::vector<llama_token> chunk_token_ids;
         std::vector<float>       chunk_hidden_states;
         local_is_end_of_turn     = false;
+        int manual_control_tokens = 0;
+        const int llm_infer_start_n_past = ctx_omni->n_past;
+        auto llm_infer_t0 = std::chrono::steady_clock::now();
+        std::string llm_infer_start_detail = "mode=duplex_pipeline,step_size=" + std::to_string(step_size);
+        omni_perf_mark(ctx_omni, "llm.decode", "start", perf_chunk_index, -1.0, llm_infer_start_detail.c_str());
 
         while (jl < step_size && !llm_finish
                && !ctx_omni->break_event.load()
@@ -10360,6 +10456,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                 ctx_omni->n_past, hidden_states, sampled_token);
 
             total_tokens_generated++;
+            if (!llm_first_token_logged) {
+                llm_first_token_logged = true;
+                double first_token_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - llm_loop_t0).count();
+                omni_perf_mark(ctx_omni, "llm.decode.first_token", "mark", perf_chunk_index, first_token_ms, nullptr);
+            }
 
             if (tmp != nullptr && hidden_states != nullptr
                 && is_valid_tts_token(sampled_token)) {
@@ -10424,7 +10526,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         if (chunk_limit_reached) {
             if (ctx_omni->special_token_chunk_eos >= 0) {
                 std::vector<llama_token> t = {ctx_omni->special_token_chunk_eos};
-                eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past);
+                if (eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past)) {
+                    manual_control_tokens += (int)t.size();
+                }
             }
             llm_finish            = true;
             current_chunk_tokens  = 0;
@@ -10433,7 +10537,25 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         // duplex chunk 末尾写入 </unit>
         if (ctx_omni->special_token_unit_end >= 0) {
             std::vector<llama_token> t = {ctx_omni->special_token_unit_end};
-            eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past);
+            if (eval_tokens(ctx_omni, params, t, params->n_batch, &ctx_omni->n_past)) {
+                manual_control_tokens += (int)t.size();
+            }
+        }
+        {
+            double llm_infer_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - llm_infer_t0).count();
+            const int compute_tokens = total_tokens_generated + manual_control_tokens;
+            std::string detail = "mode=duplex_pipeline,tokens=" + std::to_string(compute_tokens) +
+                                 ",sampled_tokens=" + std::to_string(total_tokens_generated) +
+                                 ",control_tokens=" + std::to_string(manual_control_tokens) +
+                                 ",valid_tts_tokens=" + std::to_string(chunk_token_ids.size()) +
+                                 ",n_past_delta=" + std::to_string(ctx_omni->n_past - llm_infer_start_n_past) +
+                                 omni_perf_speed_detail(compute_tokens, llm_infer_ms);
+            omni_perf_record_tokens(ctx_omni, "llm.decode", compute_tokens, llm_infer_ms);
+            omni_perf_mark(ctx_omni, "llm.decode", "end", perf_chunk_index, llm_infer_ms, detail.c_str());
+            perf_decode_total_tokens += total_tokens_generated;
+            perf_decode_compute_tokens += compute_tokens;
+            perf_decode_valid_tts_tokens += (int)chunk_token_ids.size();
         }
 
         il += total_tokens_generated;
@@ -10475,15 +10597,29 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             llm_out->hidden_states   = chunk_hidden_states;
             llm_out->n_embd          = llm_n_embd;
             llm_out->is_end_of_turn  = local_is_end_of_turn;
+            llm_out->perf_chunk_index = perf_chunk_index;
 
+            std::string tts_enqueue_detail = "mode=duplex_pipeline,tokens=" + std::to_string(chunk_token_ids.size()) +
+                                             ",llm_finish=" + std::to_string(llm_finish ? 1 : 0) +
+                                             ",text_bytes=" + std::to_string(response.size());
+            auto tts_wait_space_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "queue.tts.wait_space", "start", perf_chunk_index, -1.0, tts_enqueue_detail.c_str());
             {
                 std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
                 ctx_omni->tts_thread_info->cv.wait(lock, [&]{
                     return ctx_omni->tts_thread_info->queue.size()
                            < (size_t)ctx_omni->tts_thread_info->MAX_QUEUE_SIZE;
                 });
+                double tts_wait_space_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tts_wait_space_t0).count();
+                omni_perf_mark(ctx_omni, "queue.tts.wait_space", "end", perf_chunk_index, tts_wait_space_ms, tts_enqueue_detail.c_str());
+                auto tts_enqueue_t0 = std::chrono::steady_clock::now();
+                omni_perf_mark(ctx_omni, "queue.tts.enqueue", "start", perf_chunk_index, -1.0, tts_enqueue_detail.c_str());
                 // duplex 模式下无论 speek_done 都推送（与老 L9796 一致）
                 ctx_omni->tts_thread_info->queue.push(llm_out);
+                double tts_enqueue_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tts_enqueue_t0).count();
+                omni_perf_mark(ctx_omni, "queue.tts.enqueue", "end", perf_chunk_index, tts_enqueue_ms, tts_enqueue_detail.c_str());
             }
             ctx_omni->tts_thread_info->cv.notify_all();
         }
@@ -10529,6 +10665,14 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     auto t_dec_end = std::chrono::high_resolution_clock::now();
     double dec_ms = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_begin).count();
+    {
+        double loop_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - llm_loop_t0).count();
+        std::string detail = "mode=duplex_pipeline,tokens=" + std::to_string(perf_decode_compute_tokens) +
+                             ",sampled_tokens=" + std::to_string(perf_decode_total_tokens) +
+                             ",valid_tts_tokens=" + std::to_string(perf_decode_valid_tts_tokens);
+        omni_perf_mark(ctx_omni, "api.llm_decode_loop", "end", perf_chunk_index, loop_ms, detail.c_str());
+    }
     print_with_timestamp(
         "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
         n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - n_past_dec_0,
@@ -10610,6 +10754,9 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         //     wait prefill_queue 非空，消费队头（encoder 是单线程 FIFO 顺序）
         if (dup->in_flight_prefill.load() > 0) {
             DuplexPrefillPacket * packet = nullptr;
+            auto wait_prefill_t0 = std::chrono::steady_clock::now();
+            omni_perf_mark(ctx_omni, "wait.llm_prefill_done", "start",
+                           decode_req->perf_chunk_index, -1.0, "mode=duplex_pipeline");
             {
                 std::unique_lock<std::mutex> lk(dup->llm_mtx);
                 dup->llm_cv.wait(lk, [&]{
@@ -10623,6 +10770,10 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
                     dup->prefill_queue.pop();
                 }
             }
+            double wait_prefill_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wait_prefill_t0).count();
+            omni_perf_mark(ctx_omni, "wait.llm_prefill_done", "end",
+                           decode_req->perf_chunk_index, wait_prefill_ms, "mode=duplex_pipeline");
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
@@ -10663,6 +10814,9 @@ static bool duplex_prefill(omni_context * ctx_omni,
         return false;
     }
     DuplexPipeline * dup = ctx_omni->duplex;
+    std::string api_detail = "mode=duplex_pipeline,audio=" + aud_fname +
+                             ",image=" + (img_fname.empty() ? "none" : img_fname);
+    OmniPerfScope api_scope(ctx_omni, "api.stream_prefill", index, api_detail);
 
     DuplexEncodeReq * req = new DuplexEncodeReq();
     req->aud_fname      = aud_fname;
@@ -10698,6 +10852,11 @@ static bool duplex_decode(omni_context * ctx_omni,
         return false;
     }
     DuplexPipeline * dup = ctx_omni->duplex;
+    const int perf_chunk_index = round_idx >= 0
+        ? round_idx
+        : (ctx_omni ? ctx_omni->perf_current_chunk_index.load() : -1);
+    OmniPerfScope api_scope(ctx_omni, "api.stream_decode", perf_chunk_index,
+                            "mode=duplex_pipeline,debug_dir=" + debug_dir);
 
     // 直接 push pending_decode，"等对应 prefill 到达"的责任由 llm_thread 承担。
     // 这样 duplex_decode 返回速度只受 LLM prefill+decode 影响，不再等 encoder。
@@ -10705,6 +10864,7 @@ static bool duplex_decode(omni_context * ctx_omni,
     DuplexDecodeReq req;
     req.debug_dir = debug_dir;
     req.round_idx = round_idx;
+    req.perf_chunk_index = perf_chunk_index;
 
     {
         std::unique_lock<std::mutex> lk(dup->llm_mtx);
@@ -10904,7 +11064,6 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 double ref_prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ref_prefill_t0).count();
                 std::string detail = "n_pos=" + std::to_string(ref_audio_embeds->n_pos);
                 omni_perf_mark(ctx_omni, "session.init.ref_audio_prefill", "end", index, ref_prefill_ms, detail.c_str());
-                omni_embed_free(ref_audio_embeds);
             } else {
                 print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
             }
@@ -12086,6 +12245,15 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
             r.ms_total  = std::chrono::duration<double, std::milli>(t_dec_end - inf.t_push).count();
         }
         r.ms_prefill_submit = std::chrono::duration<double, std::milli>(inf.t_prefilled - inf.t_push).count();
+        {
+            std::string frame_detail = "user_seq=" + std::to_string(r.user_seq) +
+                                       ",prefill_submit_ms=" + std::to_string(r.ms_prefill_submit) +
+                                       ",decode_ms=" + std::to_string(r.ms_decode) +
+                                       ",ok=" + std::to_string(r.ok ? 1 : 0) +
+                                       ",is_speak=" + std::to_string(r.is_speak ? 1 : 0);
+            omni_perf_mark(ctx_omni, "api.duplex.frame_total", "end",
+                           (int)r.frame_id, r.ms_total, frame_detail.c_str());
+        }
 
         {
             std::unique_lock<std::mutex> lk(sess->done_mtx);
