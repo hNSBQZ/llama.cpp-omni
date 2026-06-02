@@ -6944,48 +6944,78 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 const int tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
                 std::vector<float> merged_embeddings;
                 bool merged_success = false;
+                std::string condition_backend = "none";
             
-            if (ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
-                // Step 1: emb_text
-                std::vector<float> llm_embeds(n_tokens_filtered * tts_n_embd, 0.0f);
-                bool emb_text_success = true;
-                for (int i = 0; i < n_tokens_filtered; i++) {
-                    if (!tts_emb_text(ctx_omni, filtered_token_ids[i], llm_embeds.data() + i * tts_n_embd, tts_n_embd)) {
-                        emb_text_success = false;
-                        break;
+                if (ctx_omni->emb_text_weight && ctx_omni->projector.initialized) {
+                    if (!ctx_omni->tts_condition_graph.initialized) {
+                        tts_condition_graph_init(ctx_omni);
+                    }
+
+                    int graph_tts_n_embd = 0;
+                    if (ctx_omni->tts_condition_graph.initialized &&
+                        tts_condition_graph_forward(ctx_omni,
+                                                    filtered_token_ids.data(),
+                                                    filtered_hidden_states.data(),
+                                                    n_tokens_filtered,
+                                                    current_chunk_n_embd,
+                                                    merged_embeddings,
+                                                    graph_tts_n_embd)) {
+                        if (graph_tts_n_embd == tts_n_embd) {
+                            condition_backend = "graph";
+                            merged_success = true;
+                        } else {
+                            LOG_ERR("TTS Duplex: condition graph tts_n_embd mismatch: got %d, expected %d\n",
+                                    graph_tts_n_embd, tts_n_embd);
+                            merged_embeddings.clear();
+                        }
                     }
                 }
-                
-                if (emb_text_success) {
-                    // Step 2: projector_semantic
-                    std::vector<float> projected_hidden(n_tokens_filtered * tts_n_embd, 0.0f);
-                    bool projector_success = tts_projector_semantic(ctx_omni, filtered_hidden_states.data(),
-                                                                     n_tokens_filtered, current_chunk_n_embd,
-                                                                     projected_hidden.data(), tts_n_embd);
+
+                if (!merged_success && ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
+                    // Step 1: emb_text
+                    std::vector<float> llm_embeds(n_tokens_filtered * tts_n_embd, 0.0f);
+                    bool emb_text_success = true;
+                    for (int i = 0; i < n_tokens_filtered; i++) {
+                        if (!tts_emb_text(ctx_omni, filtered_token_ids[i], llm_embeds.data() + i * tts_n_embd, tts_n_embd)) {
+                            emb_text_success = false;
+                            break;
+                        }
+                    }
                     
-                    if (projector_success) {
-                        // Step 3: Normalize
-                        normalize_l2_per_token(projected_hidden.data(), n_tokens_filtered, tts_n_embd);
+                    if (emb_text_success) {
+                        // Step 2: projector_semantic
+                        std::vector<float> projected_hidden(n_tokens_filtered * tts_n_embd, 0.0f);
+                        bool projector_success = tts_projector_semantic(ctx_omni, filtered_hidden_states.data(),
+                                                                         n_tokens_filtered, current_chunk_n_embd,
+                                                                         projected_hidden.data(), tts_n_embd);
                         
-                        // Step 4: Merge
-                        size_t merge_size = (size_t)n_tokens_filtered * tts_n_embd;
-                        merged_embeddings.resize(merge_size);
-                        for (size_t i = 0; i < merge_size; i++) {
-                            merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
+                        if (projector_success) {
+                            // Step 3: Normalize
+                            normalize_l2_per_token(projected_hidden.data(), n_tokens_filtered, tts_n_embd);
+                            
+                            // Step 4: Merge
+                            size_t merge_size = (size_t)n_tokens_filtered * tts_n_embd;
+                            merged_embeddings.resize(merge_size);
+                            for (size_t i = 0; i < merge_size; i++) {
+                                merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
+                            }
+                            condition_backend = "cpu";
+                            merged_success = true;
                         }
-                        
-                        // Add audio_bos_embed
-                        std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
-                        if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
-                            merged_embeddings.insert(merged_embeddings.end(), audio_bos_embed.begin(), audio_bos_embed.end());
-                            n_tokens_filtered += 1;
-                            tts_condition_tokens = n_tokens_filtered;
-                        }
-                        
-                        merged_success = true;
                     }
                 }
-            }
+
+                if (merged_success) {
+                    // Preserve the existing duplex condition shape: merged text
+                    // embeddings followed by audio_bos, then generate_audio_tokens_local
+                    // appends its own streaming BOS/EOS condition as before.
+                    std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
+                    if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
+                        merged_embeddings.insert(merged_embeddings.end(), audio_bos_embed.begin(), audio_bos_embed.end());
+                        n_tokens_filtered += 1;
+                        tts_condition_tokens = n_tokens_filtered;
+                    }
+                }
             
             // 🔧 [双工模式] 保存 LLM debug 数据（追加模式，统一放在 llm_debug 目录）
             // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
@@ -7108,6 +7138,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                                    ",audio_tokens_generated=" + std::to_string(tts_audio_tokens_generated) +
                                    ",tokens=" + std::to_string(tts_compute_tokens) +
                                    ",output_tokens=" + std::to_string(tts_audio_tokens_generated) +
+                                   ",condition_backend=" + condition_backend +
                                    ",is_end_of_turn=" + std::to_string(accumulated_is_end_of_turn ? 1 : 0) +
                                    ",flush_only=" + std::to_string(tts_flush_only ? 1 : 0);
                 tts_infer_scope.set_detail(tts_infer_detail);
