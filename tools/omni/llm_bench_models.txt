@@ -1,0 +1,10 @@
+# Six-model pure LLM benchmark split across GPUs 6 and 7.
+# The runner starts one worker per GPU and runs each GPU's models serially.
+
+o45-fp16=/cache/hanqingzhe/o45-gguf/MiniCPM-o-4_5-F16.gguf,gpu=6
+o45-q4-k-m=/cache/hanqingzhe/o45-gguf/MiniCPM-o-4_5-Q4_K_M.gguf,gpu=6
+o45-awq-w4a16=/cache/hanqingzhe/o45-awq-gguf/MiniCPM-o-4_5-AWQ-W4A16.gguf,gpu=6
+
+o45-q6-k=/cache/hanqingzhe/o45-gguf/MiniCPM-o-4_5-Q6_K.gguf,gpu=7
+o45-q8-0=/cache/hanqingzhe/o45-gguf/MiniCPM-o-4_5-Q8_0.gguf,gpu=7
+o45-gptq-int8=/cache/hanqingzhe/o45-gguf-gptq-int8/MiniCPM-o-4_5-Q8_0.gguf,gpu=7
