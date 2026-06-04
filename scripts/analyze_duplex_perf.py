@@ -38,6 +38,12 @@ GPU_STATUS_RE = re.compile(
     r'\[DUPLEX_GPU\] event=(?P<event>\S+) reason="(?P<reason>[^"]*)"'
 )
 CHUNK_RE = re.compile(r"prefill:\s*([0-9.]+) s \| decode:\s*([0-9.]+) s \| total:\s*([0-9.]+) s \| n_past:\s*(\d+)")
+OPT4_CHUNK_RE = re.compile(
+    r"--- Chunk (?P<seq>\d+)/(?P<count>\d+) --- "
+    r"prefill (?P<prefill_ms>[0-9.]+)ms \| decode (?P<decode_ms>[0-9.]+)ms \| "
+    r"e2e (?P<e2e_ms>[0-9.]+)ms \| n_past (?P<n_past>\d+) \| "
+    r"<\|(?P<decision>speak|listen)\|>(?: \"(?P<text>[^\"]*)\")?"
+)
 DECISION_RE = re.compile(r"决策:\s*<\|(speak|listen)\|>(?:\s*→\s*\"([^\"]*)\")?")
 
 STAGE_ROWS = [
@@ -170,20 +176,32 @@ def parse_log(path: Path, gpu_log_path=None):
             "reason": group["reason"],
         })
 
-    decisions = list(DECISION_RE.finditer(text))
     chunks = []
-    for idx, match in enumerate(CHUNK_RE.finditer(text)):
-        decision = decisions[idx].group(1) if idx < len(decisions) else ""
-        decision_text = decisions[idx].group(2) if idx < len(decisions) and decisions[idx].group(2) else ""
+    for match in OPT4_CHUNK_RE.finditer(text):
+        group = match.groupdict()
         chunks.append({
-            "chunk": idx,
-            "prefill_ms": float(match.group(1)) * 1000.0,
-            "decode_ms": float(match.group(2)) * 1000.0,
-            "total_ms": float(match.group(3)) * 1000.0,
-            "n_past": int(match.group(4)),
-            "decision": decision,
-            "text": decision_text,
+            "chunk": int(group["seq"]),
+            "prefill_ms": float(group["prefill_ms"]),
+            "decode_ms": float(group["decode_ms"]),
+            "total_ms": float(group["e2e_ms"]),
+            "n_past": int(group["n_past"]),
+            "decision": group["decision"],
+            "text": group["text"] or "",
         })
+    if not chunks:
+        decisions = list(DECISION_RE.finditer(text))
+        for idx, match in enumerate(CHUNK_RE.finditer(text)):
+            decision = decisions[idx].group(1) if idx < len(decisions) else ""
+            decision_text = decisions[idx].group(2) if idx < len(decisions) and decisions[idx].group(2) else ""
+            chunks.append({
+                "chunk": idx,
+                "prefill_ms": float(match.group(1)) * 1000.0,
+                "decode_ms": float(match.group(2)) * 1000.0,
+                "total_ms": float(match.group(3)) * 1000.0,
+                "n_past": int(match.group(4)),
+                "decision": decision,
+                "text": decision_text,
+            })
     return text, events, chunks, gpu_samples, gpu_statuses
 
 
@@ -480,13 +498,13 @@ def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
     width, height = 1180, 530
     left, top, chart_w = 210, 86, 900
     lanes = [
-        ("main.prefill", ["api.stream_prefill", "vision.encode", "audio.encode", "queue.llm.wait_space", "queue.llm.enqueue"]),
+        ("main.prefill", ["api.duplex.frame_total", "api.stream_prefill", "vision.encode", "audio.encode", "queue.llm.wait_space", "queue.llm.enqueue"]),
         ("llm", ["llm.prefill", "wait.llm_prefill_done", "llm.decode", "api.llm_decode_loop"]),
         ("tts", ["queue.tts.wait_space", "queue.tts.enqueue", "queue.tts.wait_data", "tts.infer"]),
         ("t2w", ["queue.t2w.enqueue", "queue.t2w.wait_data", "t2w.infer", "t2w.write"]),
     ]
     colors = {
-        "api.stream_prefill":"#4c78a8", "vision.encode":"#77aadd", "audio.encode":"#72b7b2",
+        "api.duplex.frame_total":"#8da0cb", "api.stream_prefill":"#4c78a8", "vision.encode":"#77aadd", "audio.encode":"#72b7b2",
         "queue.llm.wait_space":"#c7e9c0", "queue.llm.enqueue":"#74c476",
         "llm.prefill":"#b279a2", "wait.llm_prefill_done":"#f58518", "llm.decode":"#e45756", "api.llm_decode_loop":"#ff9da6",
         "queue.tts.wait_space":"#bae4b3", "queue.tts.enqueue":"#8cd17d", "queue.tts.wait_data":"#a1d99b", "tts.infer":"#54a24b",
@@ -826,9 +844,10 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         "## 计时口径说明",
         "",
         "- `index=0` 是 session/ref audio 初始化，不能和普通用户音频 chunk 混在一起解释。",
-        "- `api.chunk_prefill` / `api.stream_prefill` 主要覆盖 encoder 和入队；异步 LLM KV 写入体现在 `llm.prefill` 和 `wait.llm_prefill_done`。",
-        "- TTS/T2W 是后台链路，图中的 TTS/T2W `chunk` 标签按日志原值展示，但从时间线看它可能对应上一轮已经入队的文本，不能作为严格因果 ID。",
-        "- 对端到端首响、RTF 和尾包 flush 的精确测量，需要在 LLM enqueue、TTS audio token、T2W wav 输出之间增加同一个稳定请求 ID。",
+        "- `api.duplex.frame_total` 是 push frame 到 result 出队的端到端 API 包络；`api.stream_prefill` 主要覆盖 encoder submit 和入队。",
+        "- 异步 LLM KV 写入体现在 `llm.prefill` 和 `wait.llm_prefill_done`；这些内部阶段不要和 API 包络相加。",
+        "- TTS/T2W 的 `chunk` 来自随队列传递的 `perf_chunk_index`；若一次 drain 多个队列项，T2W window 仍按第一个有效 chunk 标注。",
+        "- 对端到端首响、RTF 和尾包 flush 的精确测量，仍建议在 LLM enqueue、TTS audio token、T2W wav 输出之间增加同一个稳定请求 ID。",
         "",
         "## 结构化事件完整性",
         "",
