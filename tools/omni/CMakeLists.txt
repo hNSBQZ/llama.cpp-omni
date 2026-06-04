@@ -44,6 +44,7 @@ endif()
 
 target_link_libraries     (omni PUBLIC ggml llama common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
+target_link_libraries     (omni PRIVATE ${CMAKE_DL_LIBS})
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
