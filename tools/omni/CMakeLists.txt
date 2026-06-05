@@ -12,6 +12,8 @@ endif()
 add_library(omni
             omni.cpp
             omni.h
+            omni-perf.cpp
+            omni-perf.h
             tts-condition-graph.cpp
             tts-condition-graph.h
             audition.cpp

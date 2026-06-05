@@ -22,7 +22,6 @@
 #include <iostream>
 #include <algorithm>
 #include <cerrno>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +65,6 @@
     #include <sys/wait.h>
     #include <unistd.h>
     #include <dirent.h>
-    #include <dlfcn.h>
 #endif
 
 // ============================================================
@@ -141,14 +139,6 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
 // Forward declarations
 //
 void print_with_timestamp(const char* format, ...);
-static bool omni_tts_debug_dump_enabled();
-static bool omni_gpu_prof_enabled();
-void omni_perf_mark(struct omni_context * ctx_omni,
-                    const char * stage,
-                    const char * event,
-                    int chunk_index,
-                    double duration_ms,
-                    const char * detail);
 
 // ==================== 特殊 Token 分类 ====================
 // 
@@ -3824,532 +3814,6 @@ void print_with_timestamp(const char* format, ...)
     omni_write_timestamped_line(line);
 }
 
-static void omni_perf_write_line(const char * kind, const std::string & line) {
-    const bool is_gpu_line = kind != nullptr && strcmp(kind, "DUPLEX_GPU") == 0;
-    const char * gpu_file = is_gpu_line ? std::getenv("OMNI_GPU_PROF_FILE") : nullptr;
-    if (!is_gpu_line || gpu_file == nullptr || gpu_file[0] == '\0') {
-        omni_write_timestamped_line(line);
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_omni_line_write_mutex);
-    std::ofstream out(gpu_file, std::ios::app);
-    if (out.good()) {
-        out << omni_wall_timestamp() << " " << line;
-        if (line.empty() || line.back() != '\n') {
-            out << "\n";
-        }
-    }
-}
-
-static bool omni_tts_debug_dump_enabled() {
-    const char * value = std::getenv("OMNI_TTS_DEBUG_DUMP");
-    if (value == nullptr) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char c) { return (char) std::tolower(c); });
-    return !normalized.empty() && normalized != "0" && normalized != "false" &&
-           normalized != "off" && normalized != "no";
-}
-
-static bool omni_gpu_prof_enabled() {
-    const char * value = std::getenv("OMNI_GPU_PROF");
-    if (value == nullptr) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char c) { return (char) std::tolower(c); });
-    return !normalized.empty() && normalized != "0" && normalized != "false" &&
-           normalized != "off" && normalized != "no";
-}
-
-static double omni_perf_now_ms() {
-    static const auto t0 = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(now - t0).count();
-}
-
-static double omni_perf_rss_mb() {
-#if defined(__linux__)
-    std::ifstream statm("/proc/self/statm");
-    long long total_pages = 0;
-    long long resident_pages = 0;
-    if (!(statm >> total_pages >> resident_pages)) {
-        return -1.0;
-    }
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        return -1.0;
-    }
-    return (double) resident_pages * (double) page_size / (1024.0 * 1024.0);
-#else
-    return -1.0;
-#endif
-}
-
-static bool omni_perf_gpu_memory_mb(double & used_mb, double & total_mb) {
-    used_mb = -1.0;
-    total_mb = -1.0;
-#ifdef GGML_USE_CUDA
-    const int device_count = ggml_backend_cuda_get_device_count();
-    if (device_count <= 0) {
-        return false;
-    }
-    size_t free_bytes_sum = 0;
-    size_t total_bytes_sum = 0;
-    for (int i = 0; i < device_count; ++i) {
-        size_t free_bytes = 0;
-        size_t total_bytes = 0;
-        ggml_backend_cuda_get_device_memory(i, &free_bytes, &total_bytes);
-        free_bytes_sum += free_bytes;
-        total_bytes_sum += total_bytes;
-    }
-    if (total_bytes_sum == 0) {
-        return false;
-    }
-    used_mb = (double) (total_bytes_sum - free_bytes_sum) / (1024.0 * 1024.0);
-    total_mb = (double) total_bytes_sum / (1024.0 * 1024.0);
-    return true;
-#else
-    return false;
-#endif
-}
-
-#if !defined(_WIN32)
-using nvmlReturn_t = int;
-using nvmlDevice_t = void *;
-
-struct nvmlUtilization_t {
-    unsigned int gpu;
-    unsigned int memory;
-};
-
-struct nvmlMemory_t {
-    unsigned long long total;
-    unsigned long long free;
-    unsigned long long used;
-};
-
-static constexpr nvmlReturn_t OMNI_NVML_SUCCESS = 0;
-static constexpr unsigned int OMNI_NVML_TEMPERATURE_GPU = 0;
-static constexpr unsigned int OMNI_NVML_CLOCK_GRAPHICS = 0;
-static constexpr unsigned int OMNI_NVML_CLOCK_MEM = 2;
-
-class OmniNvmlLoader {
-public:
-    ~OmniNvmlLoader() {
-        unload();
-    }
-
-    bool load(std::string & reason) {
-        if (loaded) {
-            return true;
-        }
-
-        handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
-        if (handle == nullptr) {
-            handle = dlopen("libnvidia-ml.so", RTLD_LAZY | RTLD_LOCAL);
-        }
-        if (handle == nullptr) {
-            reason = "nvml_not_found";
-            return false;
-        }
-
-        if (!load_symbol(nvmlInit_v2, "nvmlInit_v2") ||
-            !load_symbol(nvmlShutdown, "nvmlShutdown") ||
-            !load_symbol(nvmlDeviceGetCount_v2, "nvmlDeviceGetCount_v2") ||
-            !load_symbol(nvmlDeviceGetHandleByIndex_v2, "nvmlDeviceGetHandleByIndex_v2") ||
-            !load_symbol(nvmlDeviceGetUtilizationRates, "nvmlDeviceGetUtilizationRates") ||
-            !load_symbol(nvmlDeviceGetMemoryInfo, "nvmlDeviceGetMemoryInfo") ||
-            !load_symbol(nvmlDeviceGetPowerUsage, "nvmlDeviceGetPowerUsage") ||
-            !load_symbol(nvmlDeviceGetTemperature, "nvmlDeviceGetTemperature") ||
-            !load_symbol(nvmlDeviceGetClockInfo, "nvmlDeviceGetClockInfo")) {
-            reason = "nvml_symbol_missing";
-            unload();
-            return false;
-        }
-
-        loaded = true;
-        return true;
-    }
-
-    void unload() {
-        if (handle != nullptr) {
-            dlclose(handle);
-        }
-        handle = nullptr;
-        loaded = false;
-    }
-
-    using nvmlInit_v2_fn = nvmlReturn_t (*)();
-    using nvmlShutdown_fn = nvmlReturn_t (*)();
-    using nvmlDeviceGetCount_v2_fn = nvmlReturn_t (*)(unsigned int *);
-    using nvmlDeviceGetHandleByIndex_v2_fn = nvmlReturn_t (*)(unsigned int, nvmlDevice_t *);
-    using nvmlDeviceGetUtilizationRates_fn = nvmlReturn_t (*)(nvmlDevice_t, nvmlUtilization_t *);
-    using nvmlDeviceGetMemoryInfo_fn = nvmlReturn_t (*)(nvmlDevice_t, nvmlMemory_t *);
-    using nvmlDeviceGetPowerUsage_fn = nvmlReturn_t (*)(nvmlDevice_t, unsigned int *);
-    using nvmlDeviceGetTemperature_fn = nvmlReturn_t (*)(nvmlDevice_t, unsigned int, unsigned int *);
-    using nvmlDeviceGetClockInfo_fn = nvmlReturn_t (*)(nvmlDevice_t, unsigned int, unsigned int *);
-
-    nvmlInit_v2_fn nvmlInit_v2 = nullptr;
-    nvmlShutdown_fn nvmlShutdown = nullptr;
-    nvmlDeviceGetCount_v2_fn nvmlDeviceGetCount_v2 = nullptr;
-    nvmlDeviceGetHandleByIndex_v2_fn nvmlDeviceGetHandleByIndex_v2 = nullptr;
-    nvmlDeviceGetUtilizationRates_fn nvmlDeviceGetUtilizationRates = nullptr;
-    nvmlDeviceGetMemoryInfo_fn nvmlDeviceGetMemoryInfo = nullptr;
-    nvmlDeviceGetPowerUsage_fn nvmlDeviceGetPowerUsage = nullptr;
-    nvmlDeviceGetTemperature_fn nvmlDeviceGetTemperature = nullptr;
-    nvmlDeviceGetClockInfo_fn nvmlDeviceGetClockInfo = nullptr;
-
-private:
-    template <typename T>
-    bool load_symbol(T & fn, const char * name) {
-        fn = reinterpret_cast<T>(dlsym(handle, name));
-        return fn != nullptr;
-    }
-
-    void * handle = nullptr;
-    bool loaded = false;
-};
-#endif
-
-class OmniGpuPerfSampler {
-public:
-    bool start() {
-        if (running.load()) {
-            return true;
-        }
-        if (!omni_gpu_prof_enabled()) {
-            return false;
-        }
-
-        interval_ms = omni_gpu_prof_interval_ms();
-
-#if defined(_WIN32)
-        omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"nvml_unsupported_platform\"");
-        return false;
-#else
-        std::string reason;
-        if (!nvml.load(reason)) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"" + reason + "\"");
-            return false;
-        }
-        if (nvml.nvmlInit_v2() != OMNI_NVML_SUCCESS) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"nvml_init_failed\"");
-            nvml.unload();
-            return false;
-        }
-        if (nvml.nvmlDeviceGetCount_v2(&device_count) != OMNI_NVML_SUCCESS || device_count == 0) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"nvml_no_devices\"");
-            nvml.nvmlShutdown();
-            nvml.unload();
-            return false;
-        }
-
-        running = true;
-        worker = std::thread(&OmniGpuPerfSampler::run, this);
-        return true;
-#endif
-    }
-
-    void stop() {
-        if (!running.exchange(false)) {
-            return;
-        }
-        cv.notify_all();
-        if (worker.joinable()) {
-            worker.join();
-        }
-#if !defined(_WIN32)
-        if (device_count > 0) {
-            nvml.nvmlShutdown();
-        }
-        nvml.unload();
-        device_count = 0;
-#endif
-    }
-
-    ~OmniGpuPerfSampler() {
-        stop();
-    }
-
-private:
-    static int omni_gpu_prof_interval_ms() {
-        const char * value = std::getenv("OMNI_GPU_PROF_INTERVAL_MS");
-        if (value == nullptr || value[0] == '\0') {
-            return 20;
-        }
-        char * end = nullptr;
-        long parsed = std::strtol(value, &end, 10);
-        if (end == value || parsed <= 0) {
-            return 20;
-        }
-        return (int) std::max<long>(1, std::min<long>(parsed, 1000));
-    }
-
-#if !defined(_WIN32)
-    static std::string fmt_na_or_int(bool ok, unsigned int value) {
-        return ok ? std::to_string(value) : "NA";
-    }
-
-    static std::string fmt_na_or_mb(bool ok, unsigned long long bytes) {
-        if (!ok) {
-            return "NA";
-        }
-        std::ostringstream ss;
-        ss << std::fixed << std::setprecision(2)
-           << (double) bytes / (1024.0 * 1024.0);
-        return ss.str();
-    }
-
-    static std::string fmt_na_or_power(bool ok, unsigned int milliwatts) {
-        if (!ok) {
-            return "NA";
-        }
-        std::ostringstream ss;
-        ss << std::fixed << std::setprecision(2) << (double) milliwatts / 1000.0;
-        return ss.str();
-    }
-
-    void run() {
-        auto next = std::chrono::steady_clock::now();
-        while (running.load()) {
-            sample_once();
-            next += std::chrono::milliseconds(interval_ms);
-            std::unique_lock<std::mutex> lock(wait_mutex);
-            cv.wait_until(lock, next, [&] { return !running.load(); });
-            if (next < std::chrono::steady_clock::now() - std::chrono::milliseconds(interval_ms)) {
-                next = std::chrono::steady_clock::now();
-            }
-        }
-    }
-
-    void sample_once() {
-        for (unsigned int device = 0; device < device_count; ++device) {
-            nvmlDevice_t handle = nullptr;
-            if (nvml.nvmlDeviceGetHandleByIndex_v2(device, &handle) != OMNI_NVML_SUCCESS) {
-                continue;
-            }
-
-            nvmlUtilization_t util{};
-            nvmlMemory_t mem{};
-            unsigned int power_mw = 0;
-            unsigned int temp_c = 0;
-            unsigned int graphics_clock = 0;
-            unsigned int mem_clock = 0;
-
-            const bool has_util = nvml.nvmlDeviceGetUtilizationRates(handle, &util) == OMNI_NVML_SUCCESS;
-            const bool has_mem = nvml.nvmlDeviceGetMemoryInfo(handle, &mem) == OMNI_NVML_SUCCESS;
-            const bool has_power = nvml.nvmlDeviceGetPowerUsage(handle, &power_mw) == OMNI_NVML_SUCCESS;
-            const bool has_temp = nvml.nvmlDeviceGetTemperature(handle, OMNI_NVML_TEMPERATURE_GPU, &temp_c) == OMNI_NVML_SUCCESS;
-            const bool has_graphics_clock = nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_GRAPHICS, &graphics_clock) == OMNI_NVML_SUCCESS;
-            const bool has_mem_clock = nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_MEM, &mem_clock) == OMNI_NVML_SUCCESS;
-
-            const uint64_t sample_id = next_sample_id++;
-            std::ostringstream line;
-            line << "[DUPLEX_GPU] sample_id=" << sample_id
-                 << " t_ms=" << std::fixed << std::setprecision(3) << omni_perf_now_ms()
-                 << " device=" << device
-                 << " sm_util_pct=" << fmt_na_or_int(has_util, util.gpu)
-                 << " mem_util_pct=" << fmt_na_or_int(has_util, util.memory)
-                 << " gpu_used_mb=" << fmt_na_or_mb(has_mem, mem.used)
-                 << " gpu_total_mb=" << fmt_na_or_mb(has_mem, mem.total)
-                 << " power_w=" << fmt_na_or_power(has_power, power_mw)
-                 << " temp_c=" << fmt_na_or_int(has_temp, temp_c)
-                 << " graphics_clock_mhz=" << fmt_na_or_int(has_graphics_clock, graphics_clock)
-                 << " mem_clock_mhz=" << fmt_na_or_int(has_mem_clock, mem_clock);
-            omni_perf_write_line("DUPLEX_GPU", line.str());
-        }
-    }
-
-    OmniNvmlLoader nvml;
-    unsigned int device_count = 0;
-#endif
-
-    std::atomic<bool> running{false};
-    std::thread worker;
-    std::mutex wait_mutex;
-    std::condition_variable cv;
-    int interval_ms = 20;
-    uint64_t next_sample_id = 0;
-};
-
-static std::mutex g_omni_gpu_sampler_mutex;
-static std::unique_ptr<OmniGpuPerfSampler> g_omni_gpu_sampler;
-
-static void omni_gpu_perf_sampler_start() {
-    if (!omni_gpu_prof_enabled()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_omni_gpu_sampler_mutex);
-    if (!g_omni_gpu_sampler) {
-        g_omni_gpu_sampler = std::make_unique<OmniGpuPerfSampler>();
-        if (!g_omni_gpu_sampler->start()) {
-            g_omni_gpu_sampler.reset();
-        }
-    }
-}
-
-static void omni_gpu_perf_sampler_stop() {
-    std::lock_guard<std::mutex> lock(g_omni_gpu_sampler_mutex);
-    if (g_omni_gpu_sampler) {
-        g_omni_gpu_sampler->stop();
-        g_omni_gpu_sampler.reset();
-    }
-}
-
-static double omni_perf_tokens_per_s(long long tokens, double duration_ms) {
-    if (tokens <= 0 || duration_ms <= 0.0) {
-        return 0.0;
-    }
-    return (double) tokens * 1000.0 / duration_ms;
-}
-
-static std::string omni_perf_speed_detail(long long tokens, double duration_ms) {
-    std::ostringstream oss;
-    oss << ",tokens_per_s=" << std::fixed << std::setprecision(2)
-        << omni_perf_tokens_per_s(tokens, duration_ms);
-    if (tokens > 0 && duration_ms > 0.0) {
-        oss << ",ms_per_token=" << std::setprecision(4)
-            << (duration_ms / (double) tokens);
-    } else {
-        oss << ",ms_per_token=0.0000";
-    }
-    return oss.str();
-}
-
-static OmniPerfTokenStats * omni_perf_stage_stats(struct omni_context * ctx_omni, const char * stage) {
-    if (ctx_omni == nullptr || stage == nullptr) {
-        return nullptr;
-    }
-    if (std::strcmp(stage, "llm.prefill") == 0) {
-        return &ctx_omni->perf_llm_prefill;
-    }
-    if (std::strcmp(stage, "llm.decode") == 0) {
-        return &ctx_omni->perf_llm_decode;
-    }
-    if (std::strcmp(stage, "tts.infer") == 0) {
-        return &ctx_omni->perf_tts_infer;
-    }
-    return nullptr;
-}
-
-static void omni_perf_record_tokens(struct omni_context * ctx_omni, const char * stage, long long tokens, double duration_ms) {
-    if (tokens <= 0 || duration_ms < 0.0) {
-        return;
-    }
-    OmniPerfTokenStats * stats = omni_perf_stage_stats(ctx_omni, stage);
-    if (stats == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(ctx_omni->perf_token_stats_mtx);
-    stats->calls += 1;
-    stats->tokens += tokens;
-    stats->duration_ms += duration_ms;
-}
-
-static void omni_perf_print_token_stats(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(ctx_omni->perf_token_stats_mtx);
-    const auto print_one = [](const char * stage, const OmniPerfTokenStats & stats) {
-        if (stats.calls <= 0) {
-            return;
-        }
-        const double tokens_per_s = omni_perf_tokens_per_s(stats.tokens, stats.duration_ms);
-        const double ms_per_token = stats.tokens > 0 ? stats.duration_ms / (double) stats.tokens : 0.0;
-        print_with_timestamp("[DUPLEX_PERF_SUMMARY] stage=%s calls=%lld tokens=%lld total_ms=%.3f avg_tokens_per_s=%.2f avg_ms_per_token=%.4f\n",
-                             stage, stats.calls, stats.tokens, stats.duration_ms, tokens_per_s, ms_per_token);
-    };
-    print_one("llm.prefill", ctx_omni->perf_llm_prefill);
-    print_one("llm.decode", ctx_omni->perf_llm_decode);
-    print_one("tts.infer", ctx_omni->perf_tts_infer);
-}
-
-void omni_perf_mark(struct omni_context * ctx_omni,
-                    const char * stage,
-                    const char * event,
-                    int chunk_index,
-                    double duration_ms,
-                    const char * detail) {
-    double gpu_used_mb = -1.0;
-    double gpu_total_mb = -1.0;
-    const bool has_gpu = omni_perf_gpu_memory_mb(gpu_used_mb, gpu_total_mb);
-    const double rss_mb = omni_perf_rss_mb();
-    const int n_past = ctx_omni ? ctx_omni->n_past : -1;
-    const char * safe_stage = stage ? stage : "unknown";
-    const char * safe_event = event ? event : "mark";
-    const char * safe_detail = detail ? detail : "";
-    const uint64_t seq = g_omni_perf_seq++;
-
-    std::ostringstream line;
-    if (has_gpu) {
-        line << "[DUPLEX_PERF] seq=" << seq
-             << " stage=" << safe_stage
-             << " event=" << safe_event
-             << " chunk=" << chunk_index
-             << " t_ms=" << std::fixed << std::setprecision(3) << omni_perf_now_ms()
-             << " dur_ms=" << duration_ms
-             << " rss_mb=" << std::setprecision(2) << rss_mb
-             << " gpu_used_mb=" << gpu_used_mb
-             << " gpu_total_mb=" << gpu_total_mb
-             << " n_past=" << n_past
-             << " detail=\"" << safe_detail << "\"";
-    } else {
-        line << "[DUPLEX_PERF] seq=" << seq
-             << " stage=" << safe_stage
-             << " event=" << safe_event
-             << " chunk=" << chunk_index
-             << " t_ms=" << std::fixed << std::setprecision(3) << omni_perf_now_ms()
-             << " dur_ms=" << duration_ms
-             << " rss_mb=" << std::setprecision(2) << rss_mb
-             << " gpu_used_mb=NA gpu_total_mb=NA"
-             << " n_past=" << n_past
-             << " detail=\"" << safe_detail << "\"";
-    }
-    omni_perf_write_line("DUPLEX_PERF", line.str());
-}
-
-struct OmniPerfScope {
-    omni_context * ctx;
-    const char * stage;
-    int chunk_index;
-    std::string detail;
-    long long tokens = 0;
-    bool has_tokens = false;
-    std::chrono::steady_clock::time_point start;
-
-    OmniPerfScope(omni_context * ctx_, const char * stage_, int chunk_index_, const std::string & detail_)
-        : ctx(ctx_), stage(stage_), chunk_index(chunk_index_), detail(detail_),
-          start(std::chrono::steady_clock::now()) {
-        omni_perf_mark(ctx, stage, "start", chunk_index, -1.0, detail.c_str());
-    }
-
-    void set_detail(const std::string & detail_) {
-        detail = detail_;
-    }
-
-    void set_tokens(long long tokens_) {
-        tokens = tokens_;
-        has_tokens = true;
-    }
-
-    ~OmniPerfScope() {
-        const auto end = std::chrono::steady_clock::now();
-        const double duration_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        std::string final_detail = detail;
-        if (has_tokens) {
-            final_detail += omni_perf_speed_detail(tokens, duration_ms);
-            omni_perf_record_tokens(ctx, stage, tokens, duration_ms);
-        }
-        omni_perf_mark(ctx, stage, "end", chunk_index, duration_ms, final_detail.c_str());
-    }
-};
-
 static struct llama_model * llama_init(common_params * params, std::string model_path) {
     llama_backend_init();
     llama_numa_init(params->numa);
@@ -5287,13 +4751,10 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             std::string kv_prefill_detail = "items=" + std::to_string(llm_embeds.size());
             long long perf_prefill_text_tokens = 0;
             long long perf_prefill_embed_tokens = 0;
-            auto eval_prefill_string = [&](const char * text) {
-                int n_text_tokens = 0;
-                bool ok = eval_string(ctx_omni, params, text, params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens);
+            auto record_text_tokens = [&](bool ok, int n_text_tokens) {
                 if (ok) {
                     perf_prefill_text_tokens += n_text_tokens;
                 }
-                return ok;
             };
             omni_perf_mark(ctx_omni, "llm.prefill", "start", perf_chunk_index, -1.0, kv_prefill_detail.c_str());
 
@@ -5317,10 +4778,11 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     bool has_slices = (n_chunks > 1);
                     
                     // 🔧 [与 Python 对齐] 根据模式决定是否添加 <unit>
+                    int n_text_tokens = 0;
                     if (ctx_omni->duplex_mode) {
-                        eval_prefill_string("<unit><image>");
+                        record_text_tokens(eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     } else {
-                        eval_prefill_string("<image>");
+                        record_text_tokens(eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     }
                     
                     // Prefill overview embedding (第一个 chunk)
@@ -5328,21 +4790,25 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                                          params->n_batch, &ctx_omni->n_past)) {
                         perf_prefill_embed_tokens += tokens_per_chunk;
                     }
-                    eval_prefill_string("</image>");
+                    n_text_tokens = 0;
+                    record_text_tokens(eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     
                     // 🔧 [高清模式 V2.6 schema] 如果有 slices，添加 <slice> 标记
                     // 格式: <image>(overview)</image><slice>(slice1)</slice><slice>(slice2)</slice>\n
                     if (has_slices) {
                         for (int i = 1; i < n_chunks; i++) {
-                            eval_prefill_string("<slice>");
+                            n_text_tokens = 0;
+                            record_text_tokens(eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                             if (prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), tokens_per_chunk,
                                                  params->n_batch, &ctx_omni->n_past)) {
                                 perf_prefill_embed_tokens += tokens_per_chunk;
                             }
-                            eval_prefill_string("</slice>");
+                            n_text_tokens = 0;
+                            record_text_tokens(eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                         }
                         // V2.6 格式在 slices 后添加换行
-                        eval_prefill_string("\n");
+                        n_text_tokens = 0;
+                        record_text_tokens(eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     }
                     
                     print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", 
@@ -5352,14 +4818,16 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     if (has_audio) {
                         if (!ctx_omni->duplex_mode) {
                             // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                            eval_prefill_string("<|audio_start|>");
+                            n_text_tokens = 0;
+                            record_text_tokens(eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                         }
                         if (prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
                                              params->n_batch, &ctx_omni->n_past)) {
                             perf_prefill_embed_tokens += n_audio_tokens;
                         }
                         if (!ctx_omni->duplex_mode) {
-                            eval_prefill_string("<|audio_end|>");
+                            n_text_tokens = 0;
+                            record_text_tokens(eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                         }
                     }
                 }
@@ -5369,12 +4837,13 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
                     
                     // 🔧 [根据模式选择格式]
+                    int n_text_tokens = 0;
                     if (ctx_omni->duplex_mode) {
                         // 双工格式：<unit> + audio_embedding（无 audio_start/end）
-                        eval_prefill_string("<unit>");
+                        record_text_tokens(eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     } else {
                         // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                        eval_prefill_string("<|audio_start|>");
+                        record_text_tokens(eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     }
                     
                     // Prefill 音频 embedding
@@ -5385,7 +4854,8 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     
                     // 单工格式需要 <|audio_end|>
                     if (!ctx_omni->duplex_mode) {
-                        eval_prefill_string("<|audio_end|>");
+                        n_text_tokens = 0;
+                        record_text_tokens(eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     }
                 }
                 // 子分支3：纯文本输入（turn-based chat 文本对话）
@@ -5393,10 +4863,12 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                 //       任何 <|audio_start|>/<|audio_end|> 之类的 modality 包裹。
                 // 双工：与音频对齐，先 <unit> 再写入文本。
                 else if (!embeds->user_text.empty()) {
+                    int n_text_tokens = 0;
                     if (ctx_omni->duplex_mode) {
-                        eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+                        record_text_tokens(eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                     }
-                    eval_string(ctx_omni, params, embeds->user_text.c_str(), params->n_batch, &ctx_omni->n_past, false);
+                    n_text_tokens = 0;
+                    record_text_tokens(eval_string(ctx_omni, params, embeds->user_text.c_str(), params->n_batch, &ctx_omni->n_past, false, false, &n_text_tokens), n_text_tokens);
                 }
                 
                 // 🔧 [#39 滑动窗口] 注册 unit 结束
@@ -5987,7 +5459,7 @@ static bool generate_audio_tokens_local(
     print_with_timestamp("TTS Local: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d, emb_size=%zu)\n", 
                          chunk_idx, n_tokens, tts_n_embd, merged_embeddings.size());
     if (perf_chunk_index < 0 && ctx_omni) {
-        perf_chunk_index = ctx_omni->perf_current_chunk_index.load();
+        perf_chunk_index = ctx_omni->perf.current_chunk_index.load();
     }
     
     // 🔧 [安全检查] 验证输入参数
@@ -10713,7 +10185,7 @@ static bool duplex_decode(omni_context * ctx_omni,
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
     if (ctx_omni) {
-        ctx_omni->perf_current_chunk_index.store(index);
+        ctx_omni->perf.current_chunk_index.store(index);
     }
 
     // 🔧 [Duplex Pipeline Stage 1] 路由：
@@ -11159,7 +10631,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
     const int perf_chunk_index = round_idx >= 0
         ? round_idx
-        : (ctx_omni ? ctx_omni->perf_current_chunk_index.load() : -1);
+        : (ctx_omni ? ctx_omni->perf.current_chunk_index.load() : -1);
     OmniPerfScope perf_scope(ctx_omni, "api.stream_decode", perf_chunk_index, "debug_dir=" + debug_dir);
 
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
