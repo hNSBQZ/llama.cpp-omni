@@ -272,6 +272,26 @@ public:
             nvml.unload();
             return false;
         }
+        sample_devices = resolve_sample_devices(device_count);
+        if (sample_devices.empty()) {
+            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"no_selected_devices\"");
+            nvml.nvmlShutdown();
+            nvml.unload();
+            return false;
+        }
+        {
+            std::ostringstream line;
+            line << "[DUPLEX_GPU] event=devices";
+            line << " selected=\"";
+            for (size_t i = 0; i < sample_devices.size(); ++i) {
+                if (i > 0) {
+                    line << ",";
+                }
+                line << sample_devices[i];
+            }
+            line << "\"";
+            omni_perf_write_line("DUPLEX_GPU", line.str());
+        }
 
         running = true;
         worker = std::thread(&OmniGpuPerfSampler::run, this);
@@ -293,6 +313,7 @@ public:
         }
         nvml.unload();
         device_count = 0;
+        sample_devices.clear();
 #endif
     }
 
@@ -338,6 +359,66 @@ private:
         return ss.str();
     }
 
+    static void append_device_if_valid(std::vector<unsigned int> & out,
+                                       long parsed,
+                                       unsigned int device_count) {
+        if (parsed < 0 || parsed >= (long) device_count) {
+            return;
+        }
+        unsigned int device = (unsigned int) parsed;
+        if (std::find(out.begin(), out.end(), device) == out.end()) {
+            out.push_back(device);
+        }
+    }
+
+    static std::vector<unsigned int> parse_device_list(const char * value,
+                                                       unsigned int device_count) {
+        std::vector<unsigned int> devices;
+        if (value == nullptr || value[0] == '\0') {
+            return devices;
+        }
+        const std::string text(value);
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t comma = text.find(',', pos);
+            std::string item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            size_t first = item.find_first_not_of(" \t");
+            size_t last = item.find_last_not_of(" \t");
+            if (first != std::string::npos) {
+                item = item.substr(first, last - first + 1);
+                char * end = nullptr;
+                long parsed = std::strtol(item.c_str(), &end, 10);
+                if (end != item.c_str()) {
+                    append_device_if_valid(devices, parsed, device_count);
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        return devices;
+    }
+
+    static std::vector<unsigned int> resolve_sample_devices(unsigned int device_count) {
+        // Explicit override: NVML physical indices, e.g. OMNI_GPU_PROF_DEVICES=0 or 0,2.
+        std::vector<unsigned int> devices = parse_device_list(std::getenv("OMNI_GPU_PROF_DEVICES"), device_count);
+        if (!devices.empty()) {
+            return devices;
+        }
+
+        // In common single-GPU runs CUDA_VISIBLE_DEVICES limits the process to one card.
+        // NVML still sees physical indices, so sample the first visible physical id.
+        devices = parse_device_list(std::getenv("CUDA_VISIBLE_DEVICES"), device_count);
+        if (!devices.empty()) {
+            devices.resize(1);
+            return devices;
+        }
+
+        // Avoid sampling every GPU on shared servers by default.
+        return {0};
+    }
+
     void run() {
         auto next = std::chrono::steady_clock::now();
         while (running.load()) {
@@ -352,7 +433,10 @@ private:
     }
 
     void sample_once() {
-        for (unsigned int device = 0; device < device_count; ++device) {
+        for (unsigned int device : sample_devices) {
+            if (device >= device_count) {
+                continue;
+            }
             nvmlDevice_t handle = nullptr;
             if (nvml.nvmlDeviceGetHandleByIndex_v2(device, &handle) != OMNI_NVML_SUCCESS) {
                 continue;
@@ -391,6 +475,7 @@ private:
 
     OmniNvmlLoader nvml;
     unsigned int device_count = 0;
+    std::vector<unsigned int> sample_devices;
 #endif
 
     std::atomic<bool> running{false};

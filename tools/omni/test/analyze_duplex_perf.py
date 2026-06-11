@@ -14,6 +14,7 @@ import html
 import re
 import statistics
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PERF_RE = re.compile(
@@ -47,22 +48,51 @@ OPT4_CHUNK_RE = re.compile(
 DECISION_RE = re.compile(r"决策:\s*<\|(speak|listen)\|>(?:\s*→\s*\"([^\"]*)\")?")
 
 STAGE_ROWS = [
-    ("vision.encode", "#4c78a8"),
-    ("audio.encode", "#72b7b2"),
-    ("queue.llm.wait_space", "#c7e9c0"),
-    ("queue.llm.enqueue", "#74c476"),
-    ("llm.prefill", "#b279a2"),
-    ("wait.llm_prefill_done", "#f58518"),
-    ("llm.decode", "#e45756"),
-    ("queue.tts.wait_space", "#bae4b3"),
-    ("queue.tts.enqueue", "#8cd17d"),
+    ("duplex.encode", "#4c78a8"),
+    ("duplex.llm.prefill", "#b279a2"),
+    ("duplex.llm.decode", "#e45756"),
     ("tts.infer", "#54a24b"),
-    ("queue.t2w.enqueue", "#9ecae9"),
     ("t2w.infer", "#3182bd"),
     ("t2w.write", "#9e9ac8"),
 ]
 
-TOKEN_SPEED_STAGES = ["llm.prefill", "llm.decode", "tts.infer"]
+REQUESTED_STAGES = {stage for stage, _ in STAGE_ROWS}
+TOKEN_SPEED_STAGES = ["duplex.llm.prefill", "duplex.llm.decode", "tts.infer"]
+
+FRAME_STAGE_ALIASES = {
+    "encode": ["duplex.encode"],
+    "llm_prefill": ["duplex.llm.prefill"],
+    "llm_decode": ["duplex.llm.decode"],
+    "tts": ["tts.infer"],
+    "t2w_infer": ["t2w.infer"],
+    "t2w_write": ["t2w.write"],
+}
+
+FRAME_CORE_STAGES = {
+    stage
+    for names in FRAME_STAGE_ALIASES.values()
+    for stage in names
+}
+
+
+@dataclass
+class TokenStageAccumulator:
+    n: int = 0
+    tokens: int = 0
+    total_ms: float = 0.0
+    event_tokens_per_s: list[float] = field(default_factory=list)
+    event_ms_per_token: list[float] = field(default_factory=list)
+
+
+@dataclass
+class GpuStageAccumulator:
+    n_intervals: int = 0
+    n_samples: int = 0
+    total_ms: float = 0.0
+    estimated_samples: int = 0
+    sm: list[float] = field(default_factory=list)
+    mem: list[float] = field(default_factory=list)
+    power: list[float] = field(default_factory=list)
 
 
 def esc(value: object) -> str:
@@ -114,11 +144,9 @@ def token_count_for_event(event):
         return detail_int(detail, "tokens", -1)
     if event["stage"] == "tts.infer":
         return detail_int(detail, "audio_tokens_generated", -1)
-    if event["stage"] == "llm.prefill":
-        # Old logs did not have a dedicated token field; n_past_delta is the
-        # closest available KV-token proxy when no sliding happened.
+    if event["stage"] == "duplex.llm.prefill":
         return detail_int(detail, "n_past_delta", -1)
-    if event["stage"] == "llm.decode":
+    if event["stage"] == "duplex.llm.decode":
         return detail_int(detail, "tokens", -1)
     return -1
 
@@ -208,6 +236,8 @@ def parse_log(path: Path, gpu_log_path=None):
 def stage_stats(events):
     grouped = defaultdict(list)
     for event in events:
+        if event["stage"] not in REQUESTED_STAGES:
+            continue
         if event["event"] == "end" and event["dur_ms"] >= 0:
             grouped[event["stage"]].append(event["dur_ms"])
     stats = {}
@@ -225,13 +255,7 @@ def stage_stats(events):
 
 
 def stage_token_stats(events):
-    grouped = defaultdict(lambda: {
-        "n": 0,
-        "tokens": 0,
-        "total_ms": 0.0,
-        "event_tokens_per_s": [],
-        "event_ms_per_token": [],
-    })
+    grouped = defaultdict(TokenStageAccumulator)
     for event in events:
         if event["stage"] not in TOKEN_SPEED_STAGES or event["event"] != "end" or event["dur_ms"] < 0:
             continue
@@ -239,26 +263,26 @@ def stage_token_stats(events):
         if tokens < 0:
             continue
         row = grouped[event["stage"]]
-        row["n"] += 1
-        row["tokens"] += tokens
-        row["total_ms"] += event["dur_ms"]
+        row.n += 1
+        row.tokens += tokens
+        row.total_ms += event["dur_ms"]
         if tokens > 0 and event["dur_ms"] > 0:
-            row["event_tokens_per_s"].append(tokens * 1000.0 / event["dur_ms"])
-            row["event_ms_per_token"].append(event["dur_ms"] / tokens)
+            row.event_tokens_per_s.append(tokens * 1000.0 / event["dur_ms"])
+            row.event_ms_per_token.append(event["dur_ms"] / tokens)
 
     stats = {}
     for stage, row in grouped.items():
-        tokens = row["tokens"]
-        total_ms = row["total_ms"]
+        tokens = row.tokens
+        total_ms = row.total_ms
         stats[stage] = {
-            "n": row["n"],
+            "n": row.n,
             "tokens": tokens,
             "total_ms": total_ms,
             "tokens_per_s": tokens * 1000.0 / total_ms if tokens > 0 and total_ms > 0 else 0.0,
             "ms_per_token": total_ms / tokens if tokens > 0 else 0.0,
-            "avg_event_tokens_per_s": avg(row["event_tokens_per_s"]),
-            "p50_event_tokens_per_s": statistics.median(row["event_tokens_per_s"]) if row["event_tokens_per_s"] else 0.0,
-            "avg_event_ms_per_token": avg(row["event_ms_per_token"]),
+            "avg_event_tokens_per_s": avg(row.event_tokens_per_s),
+            "p50_event_tokens_per_s": statistics.median(row.event_tokens_per_s) if row.event_tokens_per_s else 0.0,
+            "avg_event_ms_per_token": avg(row.event_ms_per_token),
         }
     return stats
 
@@ -323,6 +347,161 @@ def build_stage_intervals(events):
     return intervals
 
 
+def intervals_for_aliases(by_stage, aliases):
+    for stage in aliases:
+        if by_stage.get(stage):
+            return by_stage[stage]
+    rows = []
+    for stage in aliases:
+        rows.extend(by_stage.get(stage, []))
+    return rows
+
+
+def sum_duration(rows):
+    return sum(row["duration_ms"] for row in rows)
+
+
+def max_end(rows):
+    return max((row["end_ms"] for row in rows), default=0.0)
+
+
+def infer_frame_decisions(events, chunks):
+    decisions = {chunk["chunk"]: chunk.get("decision", "") for chunk in chunks if chunk.get("chunk", -1) > 0}
+    for event in events:
+        chunk = event["chunk"]
+        if chunk <= 0 or decisions.get(chunk):
+            continue
+        detail = parse_detail(event["detail"])
+        if event["stage"] == "duplex.llm.decode" and event["event"] == "end":
+            if detail.get("is_speak") == "1":
+                decisions[chunk] = "speak"
+            elif detail.get("is_speak") == "0":
+                decisions[chunk] = "listen"
+    return decisions
+
+
+def build_frame_summaries(events, chunks, intervals, sla_ms=1000.0):
+    chunk_info = {chunk["chunk"]: chunk for chunk in chunks if chunk.get("chunk", -1) > 0}
+    decisions = infer_frame_decisions(events, chunks)
+    frame_ids = {interval["chunk"] for interval in intervals if interval["chunk"] > 0 and interval["stage"] in FRAME_CORE_STAGES}
+    frame_ids.update(chunk_info)
+    frame_ids.update(decisions)
+
+    rows = []
+    for frame_id in sorted(frame_ids):
+        frame_intervals = [
+            interval for interval in intervals
+            if interval["chunk"] == frame_id and interval["stage"] in FRAME_CORE_STAGES
+        ]
+        if not frame_intervals and frame_id not in chunk_info:
+            continue
+        by_stage = defaultdict(list)
+        for interval in frame_intervals:
+            by_stage[interval["stage"]].append(interval)
+
+        encode_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["encode"])
+        llm_prefill_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["llm_prefill"])
+        llm_decode_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["llm_decode"])
+        tts_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["tts"])
+        t2w_infer_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["t2w_infer"])
+        t2w_write_rows = intervals_for_aliases(by_stage, FRAME_STAGE_ALIASES["t2w_write"])
+
+        decision = decisions.get(frame_id, "")
+        if not decision:
+            if t2w_write_rows or tts_rows:
+                decision = "speak"
+            else:
+                decision = "unknown"
+
+        begin_ms = min((row["begin_ms"] for row in frame_intervals), default=0.0)
+        decode_end_ms = max_end(llm_decode_rows)
+        t2w_write_end_ms = max_end(t2w_write_rows)
+        if decision == "speak":
+            end_ms = t2w_write_end_ms
+            complete = bool(begin_ms and t2w_write_end_ms)
+        elif decision == "listen":
+            end_ms = decode_end_ms
+            complete = bool(begin_ms and decode_end_ms)
+        else:
+            end_ms = max((row["end_ms"] for row in frame_intervals), default=0.0)
+            complete = bool(begin_ms and end_ms)
+
+        e2e_ms = end_ms - begin_ms if complete and end_ms >= begin_ms else 0.0
+        missing = []
+        if not encode_rows:
+            missing.append("encode")
+        if not llm_prefill_rows:
+            missing.append("llm_prefill")
+        if not llm_decode_rows:
+            missing.append("llm_decode")
+        if decision == "speak":
+            if not tts_rows:
+                missing.append("tts")
+            if not t2w_infer_rows:
+                missing.append("t2w_infer")
+            if not t2w_write_rows:
+                missing.append("t2w_write")
+
+        chunk_meta = chunk_info.get(frame_id, {})
+        rows.append({
+            "frame_id": frame_id,
+            "decision": decision,
+            "complete": complete and not (decision == "speak" and missing),
+            "begin_ms": begin_ms,
+            "end_ms": end_ms,
+            "e2e_ms": e2e_ms,
+            "encode_ms": sum_duration(encode_rows),
+            "llm_prefill_ms": sum_duration(llm_prefill_rows),
+            "llm_decode_ms": sum_duration(llm_decode_rows),
+            "tts_ms": sum_duration(tts_rows),
+            "t2w_infer_ms": sum_duration(t2w_infer_rows),
+            "t2w_write_ms": sum_duration(t2w_write_rows),
+            "n_past": chunk_meta.get("n_past", 0),
+            "text": chunk_meta.get("text", ""),
+            "over_1s": bool(decision == "speak" and complete and e2e_ms > sla_ms),
+            "missing": ",".join(missing),
+        })
+    assign_utterance_ids(rows)
+    return rows
+
+
+def assign_utterance_ids(frame_rows):
+    utterance_id = 0
+    in_speak = False
+    for row in frame_rows:
+        if row["decision"] == "speak":
+            if not in_speak:
+                utterance_id += 1
+                in_speak = True
+            row["utterance_id"] = utterance_id
+        else:
+            row["utterance_id"] = 0
+            in_speak = False
+
+
+def choose_focus_frames(frame_rows):
+    groups = defaultdict(list)
+    for row in frame_rows:
+        if row.get("utterance_id", 0) > 0:
+            groups[row["utterance_id"]].append(row)
+    if not groups:
+        return frame_rows[: min(len(frame_rows), 6)]
+
+    # Prefer the longest complete SPEAK segment; it best shows a full duplex turn.
+    best_utt, speak_rows = max(
+        groups.items(),
+        key=lambda item: (
+            len([row for row in item[1] if row["complete"]]),
+            sum(row["e2e_ms"] for row in item[1]),
+        ),
+    )
+    first_idx = next(i for i, row in enumerate(frame_rows) if row.get("utterance_id") == best_utt)
+    last_idx = max(i for i, row in enumerate(frame_rows) if row.get("utterance_id") == best_utt)
+    start_idx = max(0, first_idx - 2)
+    end_idx = min(len(frame_rows) - 1, last_idx + 2)
+    return frame_rows[start_idx:end_idx + 1]
+
+
 def nearest_sample(samples, times, target):
     if not samples:
         return None
@@ -342,17 +521,11 @@ def stage_gpu_stats(intervals, gpu_samples):
     for samples in by_device.values():
         samples.sort(key=lambda sample: sample["t_ms"])
 
-    grouped = defaultdict(lambda: {
-        "n_intervals": 0,
-        "n_samples": 0,
-        "total_ms": 0.0,
-        "estimated_samples": 0,
-        "sm": [],
-        "mem": [],
-        "power": [],
-    })
+    grouped = defaultdict(GpuStageAccumulator)
 
     for interval in intervals:
+        if interval["stage"] not in REQUESTED_STAGES:
+            continue
         for device, samples in by_device.items():
             times = [sample["t_ms"] for sample in samples]
             lo = bisect.bisect_left(times, interval["begin_ms"])
@@ -365,34 +538,34 @@ def stage_gpu_stats(intervals, gpu_samples):
                 estimated = bool(sample)
 
             row = grouped[(interval["stage"], device)]
-            row["n_intervals"] += 1
-            row["total_ms"] += interval["duration_ms"]
+            row.n_intervals += 1
+            row.total_ms += interval["duration_ms"]
             if estimated:
-                row["estimated_samples"] += 1
-            row["n_samples"] += len(selected)
-            row["sm"].extend(sample["sm_util_pct"] for sample in selected if sample["sm_util_pct"] >= 0)
-            row["mem"].extend(sample["mem_util_pct"] for sample in selected if sample["mem_util_pct"] >= 0)
-            row["power"].extend(sample["power_w"] for sample in selected if sample["power_w"] >= 0)
+                row.estimated_samples += 1
+            row.n_samples += len(selected)
+            row.sm.extend(sample["sm_util_pct"] for sample in selected if sample["sm_util_pct"] >= 0)
+            row.mem.extend(sample["mem_util_pct"] for sample in selected if sample["mem_util_pct"] >= 0)
+            row.power.extend(sample["power_w"] for sample in selected if sample["power_w"] >= 0)
 
     stats = {}
     for (stage, device), row in grouped.items():
-        avg_sm = avg(row["sm"])
+        avg_sm = avg(row.sm)
         stats[(stage, device)] = {
             "stage": stage,
             "device": device,
-            "n_intervals": row["n_intervals"],
-            "n_samples": row["n_samples"],
-            "total_ms": row["total_ms"],
+            "n_intervals": row.n_intervals,
+            "n_samples": row.n_samples,
+            "total_ms": row.total_ms,
             "avg_sm_util_pct": avg_sm,
-            "p50_sm_util_pct": pctl(row["sm"], 0.50),
-            "p90_sm_util_pct": pctl(row["sm"], 0.90),
-            "max_sm_util_pct": max(row["sm"]) if row["sm"] else 0.0,
-            "avg_mem_util_pct": avg(row["mem"]),
-            "max_mem_util_pct": max(row["mem"]) if row["mem"] else 0.0,
-            "avg_power_w": avg(row["power"]),
-            "max_power_w": max(row["power"]) if row["power"] else 0.0,
-            "estimated_samples": row["estimated_samples"],
-            "stage_gpu_busy_ms": row["total_ms"] * avg_sm / 100.0,
+            "p50_sm_util_pct": pctl(row.sm, 0.50),
+            "p90_sm_util_pct": pctl(row.sm, 0.90),
+            "max_sm_util_pct": max(row.sm) if row.sm else 0.0,
+            "avg_mem_util_pct": avg(row.mem),
+            "max_mem_util_pct": max(row.mem) if row.mem else 0.0,
+            "avg_power_w": avg(row.power),
+            "max_power_w": max(row.power) if row.power else 0.0,
+            "estimated_samples": row.estimated_samples,
+            "stage_gpu_busy_ms": row.total_ms * avg_sm / 100.0,
         }
     return stats
 
@@ -417,33 +590,193 @@ def write(path: Path, content: str):
     path.write_text(content)
 
 
+def cleanup_report_dir(out_dir: Path):
+    stale_files = [
+        "omni-duplex-frame-summary.csv",
+        "omni-duplex-gpu-samples.csv",
+        "omni-duplex-sla.md",
+        "omni-duplex-stage-gpu-stats.csv",
+        "omni-duplex-stage-stats.csv",
+        "omni-duplex-stage-timing-table.md",
+        "omni-duplex-stage-token-speed.csv",
+        "omni-duplex-tts-token-stats.csv",
+        "figures/omni-duplex-overlap-timeline.svg",
+        "figures/omni-duplex-stage-latency.svg",
+    ]
+    for name in stale_files:
+        path = out_dir / name
+        if path.exists():
+            path.unlink()
+
+
 def pipeline_svg(path: Path):
     body = [
-        '<rect width="1180" height="640" fill="#ffffff"/>',
+        '<rect width="1180" height="520" fill="#ffffff"/>',
         '<text x="40" y="42" class="title">Omni Duplex 实测流水线</text>',
-        '<text x="40" y="66" class="subtitle">主线程按 chunk 串行推进；LLM KV prefill、TTS 和 T2W 在后台线程中异步执行</text>',
+        '<text x="40" y="66" class="subtitle">只展示用户关心的数据处理阶段；计时从线程拿到队列数据后开始，不包含等待队列时间</text>',
     ]
-    lanes = [("主线程 / API", 110), ("LLM 线程", 235), ("TTS 线程", 360), ("T2W 线程", 485)]
+    lanes = [("Encode", 120), ("LLM", 235), ("TTS", 350), ("T2W", 465)]
     for lane, y in lanes:
-        body += [f'<rect x="30" y="{y - 42}" width="1120" height="92" class="lane" rx="14"/>', f'<text x="48" y="{y - 14}" class="label" font-weight="700">{esc(lane)}</text>']
+        body += [f'<rect x="30" y="{y - 42}" width="1120" height="76" class="lane" rx="14"/>', f'<text x="48" y="{y - 14}" class="label" font-weight="700">{esc(lane)}</text>']
     boxes = [
-        (170, 96, 160, 48, "api.stream_prefill", "vision + audio encode", "#dcecff"),
-        (365, 96, 150, 48, "queue.llm", "enqueue embedding", "#d8f3dc"),
-        (560, 96, 150, 48, "api.stream_decode", "wait + sample", "#fff2cc"),
-        (760, 96, 150, 48, "decision", "LISTEN / SPEAK", "#ffe4e6"),
-        (365, 222, 165, 48, "llm.prefill", "write KV cache", "#e6dcff"),
-        (560, 222, 165, 48, "llm.decode", "token loop", "#ffd6a5"),
-        (760, 347, 180, 48, "tts.infer", "token/hidden -> audio token", "#d0f4de"),
-        (760, 472, 180, 48, "t2w.infer", "audio tokens -> wav", "#cde7ff"),
+        (225, 96, 190, 48, "duplex.encode", "frame -> embeddings", "#dcecff"),
+        (225, 211, 190, 48, "duplex.llm.prefill", "embeddings -> KV", "#e6dcff"),
+        (505, 211, 190, 48, "duplex.llm.decode", "KV -> text/hidden", "#ffd6a5"),
+        (505, 326, 190, 48, "tts.infer", "hidden -> audio tokens", "#d0f4de"),
+        (505, 441, 190, 48, "t2w.infer", "audio tokens -> wav", "#cde7ff"),
+        (775, 441, 190, 48, "t2w.write", "write wav", "#e6e1f2"),
     ]
     for x, y, w, h, title, sub, color in boxes:
         body += [f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{color}" class="box"/>', f'<text x="{x + 12}" y="{y + 20}" class="label" font-weight="700">{esc(title)}</text>', f'<text x="{x + 12}" y="{y + 38}" class="small">{esc(sub)}</text>']
     body.append('<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#29415f"/></marker></defs>')
-    for x1, y1, x2, y2 in [(330,120,365,120),(515,120,560,120),(710,120,760,120),(440,144,440,222),(530,246,560,246),(635,222,635,144),(835,144,835,347),(850,395,850,472),(940,496,1040,496)]:
+    for x1, y1, x2, y2 in [(415,120,505,235),(695,235,505,350),(695,350,505,465),(695,465,775,465)]:
         body.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#29415f" stroke-width="1.8" marker-end="url(#arrow)"/>')
-    for x, text in [(60, "index=0 是 session/ref audio 初始化"), (420, "decode 包含等待异步 KV prefill"), (795, "TTS/T2W 与下一轮 chunk 重叠")]:
-        body.append(f'<text x="{x}" y="585" class="small">• {esc(text)}</text>')
-    write(path, svg_base(1180, 640, body))
+    body.append(f'<text x="60" y="505" class="small">• {esc("LISTEN 帧只要求 encode + LLM；SPEAK 帧 e2e 到最后一次 t2w.write.end")}</text>')
+    write(path, svg_base(1180, 520, body))
+
+
+def frame_pipeline_svg(path: Path, frame_rows, intervals):
+    if not frame_rows:
+        pipeline_svg(path)
+        return
+
+    lane_names = ["Encode", "LLM", "TTS", "T2W"]
+    stage_lane = {
+        "duplex.encode": "Encode",
+        "duplex.llm.prefill": "LLM",
+        "duplex.llm.decode": "LLM",
+        "tts.infer": "TTS",
+        "t2w.infer": "T2W",
+        "t2w.write": "T2W",
+    }
+    colors = {stage: color for stage, color in STAGE_ROWS}
+    colors.update({
+        "duplex.encode": "#4c78a8",
+        "duplex.llm.prefill": "#b279a2",
+        "duplex.llm.decode": "#e45756",
+    })
+
+    focus_rows = choose_focus_frames(frame_rows)
+    focus_frame_ids = {row["frame_id"] for row in focus_rows}
+    focus_utterances = sorted({row.get("utterance_id", 0) for row in focus_rows if row.get("utterance_id", 0) > 0})
+    focus_utterance = focus_utterances[0] if focus_utterances else 0
+
+    drawable = [
+        interval for interval in intervals
+        if interval["chunk"] in focus_frame_ids and interval["stage"] in stage_lane
+    ]
+    if not drawable:
+        pipeline_svg(path)
+        return
+
+    start_ms = min(row["begin_ms"] for row in focus_rows if row["begin_ms"] > 0)
+    end_ms = max(max(row["end_ms"], row["begin_ms"] + 1000.0) for row in focus_rows if row["begin_ms"] > 0)
+    span = max(1.0, end_ms - start_ms)
+    width = 1320
+    left, chart_w = 170, 1080
+    top, lane_h = 140, 82
+    height = top + len(lane_names) * lane_h + 118
+
+    def x_of(t_ms):
+        return left + (t_ms - start_ms) / span * chart_w
+
+    lane_y = {lane: top + idx * lane_h for idx, lane in enumerate(lane_names)}
+    body = [
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        '<text x="40" y="42" class="title">Duplex Pipeline: One SPEAK Turn</text>',
+        '<text x="40" y="66" class="subtitle">竖线标记 1s 输入间隔</text>',
+    ]
+
+    for row in focus_rows:
+        if row["begin_ms"] <= 0:
+            continue
+        x = x_of(row["begin_ms"])
+        body += [
+            f'<line x1="{x:.1f}" y1="100" x2="{x:.1f}" y2="{top + len(lane_names) * lane_h - 26}" stroke="#cfd8e6" stroke-width="1.5"/>',
+            f'<text x="{x + 4:.1f}" y="{top - 24}" class="tiny">f{row["frame_id"]}</text>',
+        ]
+    # Draw regular 1s cadence labels so the input rhythm is obvious.
+    cadence = 0.0
+    while cadence <= span + 1.0:
+        x = left + cadence / span * chart_w
+        body.append(f'<text x="{x - 8:.1f}" y="{height - 28}" class="tiny">{cadence / 1000.0:.0f}s</text>')
+        cadence += 1000.0
+
+    for lane in lane_names:
+        y = lane_y[lane]
+        body += [
+            f'<rect x="40" y="{y - 18}" width="{width - 80}" height="54" fill="#f6f8fb" stroke="#d6dde8" rx="10"/>',
+            f'<text x="56" y="{y + 5}" class="label" font-weight="700">{esc(lane)}</text>',
+        ]
+
+    for row in focus_rows:
+        if row["begin_ms"] <= 0 or row["end_ms"] <= 0:
+            continue
+        x = x_of(row["begin_ms"])
+        w = max(2.0, x_of(row["end_ms"]) - x)
+        stroke = "#2ca25f" if row["decision"] == "speak" else "#8b95a5"
+        body.append(
+            f'<rect x="{x:.1f}" y="{top - 24}" width="{w:.1f}" height="{len(lane_names) * lane_h - 32}" '
+            f'fill="none" stroke="{stroke}" stroke-width="1" stroke-dasharray="4 4" rx="8"/>'
+        )
+        label = f'f{row["frame_id"]} {row["decision"]}'
+        if row.get("utterance_id", 0) > 0:
+            label += f' u{row["utterance_id"]}'
+        body.append(f'<text x="{x + 4:.1f}" y="{top - 10}" class="tiny">{esc(label)}</text>')
+
+    stage_offsets = {
+        "duplex.encode": -8,
+        "duplex.llm.prefill": -8,
+        "duplex.llm.decode": 10,
+        "tts.infer": 0,
+        "t2w.infer": -8,
+        "t2w.write": 10,
+    }
+    for interval in sorted(drawable, key=lambda item: (item["begin_ms"], item["chunk"], item["stage"])):
+        lane = stage_lane[interval["stage"]]
+        x = x_of(interval["begin_ms"])
+        raw_w = (interval["end_ms"] - interval["begin_ms"]) / span * chart_w
+        w = max(2.0, raw_w)
+        y = lane_y[lane] - 2 + stage_offsets.get(interval["stage"], 0)
+        body.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="14" '
+            f'fill="{colors.get(interval["stage"], "#8b95a5")}" rx="3"/>'
+        )
+        if raw_w < 4.0:
+            # Keep tiny stages honest in time scale: the bar remains short, while
+            # a small tick makes the stage visible without implying a longer duration.
+            body.append(
+                f'<line x1="{x:.1f}" y1="{y - 2:.1f}" x2="{x:.1f}" y2="{y + 16:.1f}" '
+                f'stroke="{colors.get(interval["stage"], "#8b95a5")}" stroke-width="2"/>'
+            )
+        if w > 42:
+            label = interval["stage"].replace("duplex.", "")
+            body.append(f'<text x="{x + 4:.1f}" y="{y + 11:.1f}" class="tiny">{esc(label)} {interval["duration_ms"]:.0f}ms</text>')
+
+    legend_x = 40
+    legend_y = height - 88
+    legend_items = [
+        ("SPEAK frame", "#2ca25f"),
+        ("LISTEN frame", "#8b95a5"),
+        ("duplex.encode", colors["duplex.encode"]),
+        ("duplex.llm.prefill", colors["duplex.llm.prefill"]),
+        ("duplex.llm.decode", colors["duplex.llm.decode"]),
+        ("tts.infer", colors["tts.infer"]),
+        ("t2w.infer", colors["t2w.infer"]),
+        ("t2w.write", colors["t2w.write"]),
+    ]
+    body.append(f'<text x="{legend_x}" y="{legend_y}" class="label" font-weight="700">Legend</text>')
+    for idx, (label, color) in enumerate(legend_items):
+        col = idx % 4
+        row = idx // 4
+        x = legend_x + col * 295
+        y = legend_y + 16 + row * 22
+        body += [
+            f'<rect x="{x}" y="{y}" width="22" height="12" fill="{color}" rx="3"/>',
+            f'<text x="{x + 30}" y="{y + 11}" class="small">{esc(label)}</text>',
+        ]
+
+    write(path, svg_base(width, height, body))
 
 
 def stage_latency_svg(path: Path, stats):
@@ -466,53 +799,22 @@ def stage_latency_svg(path: Path, stats):
     write(path, svg_base(width, height, body))
 
 
-def chunk_latency_svg(path: Path, chunks):
-    width, height = 1180, 560
-    left, top, chart_w, chart_h = 70, 90, 1030, 350
-    max_total = max([c["total_ms"] for c in chunks] + [1])
-    max_n_past = max([c["n_past"] for c in chunks] + [1])
-    bar_gap = 3
-    bar_w = max(6, (chart_w - bar_gap * max(0, len(chunks) - 1)) / max(1, len(chunks)))
-    body = ['<rect width="1180" height="560" fill="#ffffff"/>', '<text x="40" y="42" class="title">逐 chunk API 延迟</text>', '<text x="40" y="66" class="subtitle">蓝色=prefill，橙色=decode；圆点表示决策，绿=SPEAK，灰=LISTEN；紫线=n_past</text>']
-    for tick in range(0, int(max_total) + 51, 50):
-        y = top + chart_h - tick / max_total * chart_h
-        body += [f'<line x1="{left}" y1="{y:.1f}" x2="{left + chart_w}" y2="{y:.1f}" stroke="#edf1f7"/>', f'<text x="30" y="{y + 4:.1f}" class="tiny">{tick}</text>']
-    prev = None
-    for idx, chunk in enumerate(chunks):
-        x = left + idx * (bar_w + bar_gap)
-        pre_h, dec_h = chunk["prefill_ms"] / max_total * chart_h, chunk["decode_ms"] / max_total * chart_h
-        y_pre, y_dec = top + chart_h - pre_h, top + chart_h - pre_h - dec_h
-        color = "#2ca25f" if chunk["decision"] == "speak" else "#8b95a5"
-        body += [f'<rect x="{x:.1f}" y="{y_pre:.1f}" width="{bar_w:.1f}" height="{pre_h:.1f}" fill="#4c78a8"/>', f'<rect x="{x:.1f}" y="{y_dec:.1f}" width="{bar_w:.1f}" height="{dec_h:.1f}" fill="#f58518"/>', f'<circle cx="{x + bar_w / 2:.1f}" cy="{y_dec - 7:.1f}" r="3.2" fill="{color}"/>']
-        if idx % 5 == 0:
-            body.append(f'<text x="{x - 2:.1f}" y="{top + chart_h + 18}" class="tiny">{idx}</text>')
-        point = (x + bar_w / 2, top + chart_h - chunk["n_past"] / max_n_past * chart_h)
-        if prev:
-            body.append(f'<line x1="{prev[0]:.1f}" y1="{prev[1]:.1f}" x2="{point[0]:.1f}" y2="{point[1]:.1f}" stroke="#6f4e7c" stroke-width="1.5" opacity="0.65"/>')
-        prev = point
-    body += ['<rect x="845" y="92" width="250" height="88" fill="#ffffff" stroke="#d6dde8" rx="10"/>', '<rect x="865" y="112" width="22" height="12" fill="#4c78a8"/><text x="895" y="122" class="small">prefill</text>', '<rect x="865" y="136" width="22" height="12" fill="#f58518"/><text x="895" y="146" class="small">decode</text>', '<circle cx="876" cy="164" r="4" fill="#2ca25f"/><text x="895" y="168" class="small">SPEAK；紫线=n_past</text>']
-    write(path, svg_base(width, height, body))
-
-
 def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
     width, height = 1180, 530
     left, top, chart_w = 210, 86, 900
     lanes = [
-        ("main.prefill", ["api.duplex.frame_total", "api.stream_prefill", "vision.encode", "audio.encode", "queue.llm.wait_space", "queue.llm.enqueue"]),
-        ("llm", ["llm.prefill", "wait.llm_prefill_done", "llm.decode", "api.llm_decode_loop"]),
-        ("tts", ["queue.tts.wait_space", "queue.tts.enqueue", "queue.tts.wait_data", "tts.infer"]),
-        ("t2w", ["queue.t2w.enqueue", "queue.t2w.wait_data", "t2w.infer", "t2w.write"]),
+        ("encode", ["duplex.encode"]),
+        ("llm", ["duplex.llm.prefill", "duplex.llm.decode"]),
+        ("tts", ["tts.infer"]),
+        ("t2w", ["t2w.infer", "t2w.write"]),
     ]
     colors = {
-        "api.duplex.frame_total":"#8da0cb", "api.stream_prefill":"#4c78a8", "vision.encode":"#77aadd", "audio.encode":"#72b7b2",
-        "queue.llm.wait_space":"#c7e9c0", "queue.llm.enqueue":"#74c476",
-        "llm.prefill":"#b279a2", "wait.llm_prefill_done":"#f58518", "llm.decode":"#e45756", "api.llm_decode_loop":"#ff9da6",
-        "queue.tts.wait_space":"#bae4b3", "queue.tts.enqueue":"#8cd17d", "queue.tts.wait_data":"#a1d99b", "tts.infer":"#54a24b",
-        "queue.t2w.enqueue":"#9ecae9", "queue.t2w.wait_data":"#c6dbef", "t2w.infer":"#3182bd", "t2w.write":"#9e9ac8",
+        "duplex.encode":"#4c78a8", "duplex.llm.prefill":"#b279a2", "duplex.llm.decode":"#e45756",
+        "tts.infer":"#54a24b", "t2w.infer":"#3182bd", "t2w.write":"#9e9ac8",
     }
     stage_lane = {stage: lane for lane, stages in lanes for stage in stages}
     lane_y = {}
-    body = ['<rect width="1180" height="530" fill="#ffffff"/>', '<text x="40" y="42" class="title">异步重叠时间线：约 0.85s 到 1.40s</text>', '<text x="40" y="66" class="subtitle">TTS/T2W 与下一轮 prefill/decode 同时运行；chunk 标签按日志原值显示</text>']
+    body = ['<rect width="1180" height="530" fill="#ffffff"/>', '<text x="40" y="42" class="title">异步重叠时间线：约 0.85s 到 1.40s</text>', '<text x="40" y="66" class="subtitle">只显示 encode、LLM、TTS、T2W 数据处理区间；不包含队列等待</text>']
     for tick in range(int(start_ms), int(end_ms) + 1, 50):
         x = left + (tick - start_ms) / (end_ms - start_ms) * chart_w
         body += [f'<line x1="{x:.1f}" y1="80" x2="{x:.1f}" y2="455" stroke="#edf1f7"/>', f'<text x="{x - 14:.1f}" y="478" class="tiny">{tick}</text>']
@@ -590,7 +892,7 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
                 body.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="1.8"/>')
 
     stage_colors = {stage: color for stage, color in STAGE_ROWS}
-    focus_stages = ["llm.prefill", "llm.decode", "tts.infer", "t2w.infer", "vision.encode", "audio.encode"]
+    focus_stages = ["duplex.encode", "duplex.llm.prefill", "duplex.llm.decode", "tts.infer", "t2w.infer", "t2w.write"]
     lane_y = {stage: stage_top + 22 + idx * 26 for idx, stage in enumerate(focus_stages)}
     body += [f'<text x="40" y="{stage_top}" class="label" font-weight="700">stage intervals</text>']
     for stage in focus_stages:
@@ -609,18 +911,13 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
     write(path, svg_base(width, height, body))
 
 
-def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens, token_stats):
+def write_csvs(out_dir: Path, stats, gpu_samples, gpu_stats, tts_tokens, token_stats):
     with (out_dir / "omni-duplex-stage-stats.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["stage", "n", "total_ms", "avg_ms", "p50_ms", "p90_ms", "min_ms", "max_ms"])
         for stage in sorted(stats):
             row = stats[stage]
             writer.writerow([stage, row["n"], f'{row["total"]:.3f}', f'{row["avg"]:.3f}', f'{row["p50"]:.3f}', f'{row["p90"]:.3f}', f'{row["min"]:.3f}', f'{row["max"]:.3f}'])
-    with (out_dir / "omni-duplex-chunk-summary.csv").open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["chunk", "prefill_ms", "decode_ms", "total_ms", "n_past", "decision", "text"])
-        for chunk in chunks:
-            writer.writerow([chunk["chunk"], f'{chunk["prefill_ms"]:.3f}', f'{chunk["decode_ms"]:.3f}', f'{chunk["total_ms"]:.3f}', chunk["n_past"], chunk["decision"], chunk["text"]])
     with (out_dir / "omni-duplex-gpu-samples.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["sample_id", "t_ms", "device", "sm_util_pct", "mem_util_pct", "gpu_used_mb", "gpu_total_mb", "power_w", "temp_c", "graphics_clock_mhz", "mem_clock_mhz"])
@@ -655,17 +952,97 @@ def write_csvs(out_dir: Path, stats, chunks, gpu_samples, gpu_stats, tts_tokens,
             writer.writerow([row["chunk"], row["tts_chunk"], f'{row["dur_ms"]:.3f}', row["llm_tokens"], row["filtered_llm_tokens"], row["condition_tokens"], row["compute_tokens"], row["audio_tokens_generated"], row["is_end_of_turn"], row["flush_only"], f'{row["compute_tokens_per_s"]:.3f}', f'{row["audio_tokens_per_ms"]:.6f}', f'{row["audio_tokens_per_s"]:.3f}', f'{row["ms_per_audio_token"]:.3f}', row["has_audio_token_detail"]])
 
 
+def write_frame_summary_csv(out_dir: Path, frame_rows):
+    with (out_dir / "omni-duplex-frame-summary.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame_id",
+            "utterance_id",
+            "decision",
+            "complete",
+            "audio_e2e_ms",
+            "encode_ms",
+            "llm_prefill_ms",
+            "llm_decode_ms",
+            "tts_ms",
+            "t2w_infer_ms",
+            "t2w_write_ms",
+            "n_past",
+            "over_1s",
+            "missing",
+            "text",
+        ])
+        for row in frame_rows:
+            writer.writerow([
+                row["frame_id"],
+                row.get("utterance_id", 0),
+                row["decision"],
+                int(row["complete"]),
+                f'{row["e2e_ms"]:.3f}',
+                f'{row["encode_ms"]:.3f}',
+                f'{row["llm_prefill_ms"]:.3f}',
+                f'{row["llm_decode_ms"]:.3f}',
+                f'{row["tts_ms"]:.3f}',
+                f'{row["t2w_infer_ms"]:.3f}',
+                f'{row["t2w_write_ms"]:.3f}',
+                row["n_past"],
+                int(row["over_1s"]),
+                row["missing"],
+                row["text"],
+            ])
+
+
+def write_sla_report(path: Path, frame_rows, sla_ms=1000.0):
+    speak_rows = [row for row in frame_rows if row["decision"] == "speak"]
+    complete_speak = [row for row in speak_rows if row["complete"] and row["e2e_ms"] > 0]
+    listen_rows = [row for row in frame_rows if row["decision"] == "listen"]
+    incomplete_speak = [row for row in speak_rows if not row["complete"]]
+    values = [row["e2e_ms"] for row in complete_speak]
+    passed = bool(values) and not incomplete_speak and max(values) <= sla_ms
+    result = "PASS" if passed else "FAIL"
+
+    lines = [
+        "# Omni Duplex SPEAK SLA",
+        "",
+        f"- SLA：SPEAK 帧 audio e2e `<= {sla_ms:.0f} ms`，起点为该帧底层 encode 开始，终点为该帧最后一次 `t2w.write.end`。",
+        f"- 结论：`{result}`。",
+        f"- Frames：总计 `{len(frame_rows)}`，SPEAK `{len(speak_rows)}`，LISTEN `{len(listen_rows)}`，完整 SPEAK `{len(complete_speak)}`，不完整 SPEAK `{len(incomplete_speak)}`。",
+    ]
+    if values:
+        lines.extend([
+            f"- SPEAK e2e：avg `{avg(values):.1f} ms`，p50 `{statistics.median(values):.1f} ms`，p95 `{pctl(values, 0.95):.1f} ms`，max `{max(values):.1f} ms`。",
+            "",
+            "| frame | e2e ms | encode | llm prefill | llm decode | tts | t2w infer | t2w write | status |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ])
+        for row in complete_speak:
+            status = "over_1s" if row["over_1s"] else "ok"
+            lines.append(
+                f"| {row['frame_id']} | {row['e2e_ms']:.1f} | {row['encode_ms']:.1f} | "
+                f"{row['llm_prefill_ms']:.1f} | {row['llm_decode_ms']:.1f} | {row['tts_ms']:.1f} | "
+                f"{row['t2w_infer_ms']:.1f} | {row['t2w_write_ms']:.1f} | `{status}` |"
+            )
+    else:
+        lines.append("- 未找到完整 SPEAK 帧，无法给出有效 e2e 统计。")
+
+    if incomplete_speak:
+        lines.extend([
+            "",
+            "## 不完整 SPEAK 帧",
+            "",
+            "| frame | missing | text |",
+            "| ---: | --- | --- |",
+        ])
+        for row in incomplete_speak:
+            lines.append(
+                f"| {row['frame_id']} | `{row['missing'] or 'unknown'}` | {esc(row['text'][:80])} |"
+            )
+
+    lines.append("")
+    write(path, "\n".join(lines))
+
+
 def stage_kind(stage: str) -> str:
-    if stage.startswith("api."):
-        return "api"
-    if stage.startswith("queue."):
-        return "queue"
-    if stage.startswith("wait."):
-        return "wait"
-    if stage.startswith("control."):
-        return "control"
-    if stage.startswith("session."):
-        return "session"
     if stage.endswith(".write"):
         return "io"
     return "compute"
@@ -718,144 +1095,120 @@ def gpu_stage_summary(gpu_stats, stage):
     }
 
 
-def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens, token_stats):
+def active_gpu_ids(gpu_samples, max_devices=1):
+    by_device = defaultdict(list)
+    for sample in gpu_samples:
+        by_device[sample["device"]].append(sample)
+    scores = []
+    for device, samples in by_device.items():
+        sm_values = [sample["sm_util_pct"] for sample in samples if sample["sm_util_pct"] >= 0]
+        mem_values = [sample["gpu_used_mb"] for sample in samples if sample["gpu_used_mb"] >= 0]
+        max_sm = max(sm_values) if sm_values else 0.0
+        avg_sm = avg(sm_values)
+        mem_delta = (max(mem_values) - min(mem_values)) if mem_values else 0.0
+        score = max_sm * 1000.0 + avg_sm * 100.0 + mem_delta
+        if score > 0:
+            scores.append((score, device))
+    scores.sort(reverse=True)
+    return [device for _, device in scores[:max_devices]]
+
+
+def filter_gpu_samples(gpu_samples, device_ids):
+    if not device_ids:
+        return gpu_samples
+    keep = set(device_ids)
+    return [sample for sample in gpu_samples if sample["device"] in keep]
+
+
+def stage_display_name(stage):
+    return {
+        "duplex.encode": "Encode",
+        "duplex.llm.prefill": "LLM Prefill",
+        "duplex.llm.decode": "LLM Decode",
+        "tts.infer": "TTS",
+        "t2w.infer": "T2W",
+        "t2w.write": "Wav Write",
+    }.get(stage, stage)
+
+
+def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, token_stats, frame_rows):
     decisions = Counter(c["decision"] for c in chunks)
-    event_counts = Counter((e["stage"], e["event"]) for e in events)
-    user_chunks = chunks[1:] if len(chunks) > 1 else chunks
-    speak = [c for c in chunks if c["decision"] == "speak"]
-    listen = [c for c in chunks if c["decision"] == "listen"]
-    gpu = [e["gpu_used_mb"] for e in events if e["gpu_used_mb"] >= 0]
-    rss = [e["rss_mb"] for e in events if e["rss_mb"] >= 0]
-    def st(stage, key="avg"):
-        return stats.get(stage, {}).get(key, 0.0)
-    tts_tokens_with_detail = [row for row in tts_tokens if row["has_audio_token_detail"]]
-    tts_audio_values = [row["audio_tokens_generated"] for row in tts_tokens_with_detail]
-    rss_range = f"{min(rss):.0f}-{max(rss):.0f} MB" if rss else "NA"
-    gpu_range = f"{min(gpu):.0f}-{max(gpu):.0f} MB" if gpu else "NA"
     def speed(stage):
         return token_stats.get(stage, {}).get("tokens_per_s", 0.0)
+    complete_speak_frames = [
+        row for row in frame_rows
+        if row["decision"] == "speak" and row["complete"] and row["e2e_ms"] > 0
+    ]
+    speak_rows = [row for row in frame_rows if row["decision"] == "speak"]
+    listen_rows = [row for row in frame_rows if row["decision"] == "listen"]
+    incomplete_speak = [row for row in speak_rows if not row["complete"]]
+    speak_e2e = [row["e2e_ms"] for row in complete_speak_frames]
+    sla_ms = 1000.0
+    supports_duplex = bool(speak_e2e) and not incomplete_speak and max(speak_e2e) <= sla_ms
+    conclusion = "支持双工" if supports_duplex else "暂不满足双工"
+    reason = (
+        f"完整 SPEAK 帧最慢 {max(speak_e2e):.1f} ms，低于 1s 输入间隔"
+        if supports_duplex and speak_e2e
+        else "存在不完整 SPEAK 帧或最慢 SPEAK e2e 超过 1s"
+    )
+
+    utterances = sorted({row.get("utterance_id", 0) for row in speak_rows if row.get("utterance_id", 0) > 0})
+
     lines = [
-        "# Omni Duplex TTS GPU 实测性能报告",
+        "# Duplex 1s 流式测试结论",
         "",
-        f"- 日志：`{log_path.name}`",
-        f"- 解析到 `{len(events)}` 条结构化 `[DUPLEX_PERF]` 事件；原始 marker 为 `{text.count('[DUPLEX_PERF]')}` 条。",
-        f"- Chunk：`{len(chunks)}`；SPEAK/LISTEN：`{decisions.get('speak', 0)}` / `{decisions.get('listen', 0)}`。",
-        f"- API 口径：平均 prefill `{avg(c['prefill_ms'] for c in chunks):.1f} ms`，平均 decode `{avg(c['decode_ms'] for c in chunks):.1f} ms`，平均每 chunk `{avg(c['total_ms'] for c in chunks):.1f} ms`。",
-        f"- 用户 chunk 口径（排除 `index=0`）：平均 prefill `{avg(c['prefill_ms'] for c in user_chunks):.1f} ms`，平均 decode `{avg(c['decode_ms'] for c in user_chunks):.1f} ms`，平均每 chunk `{avg(c['total_ms'] for c in user_chunks):.1f} ms`。",
-        f"- 阶段平均速度：`llm.prefill` `{speed('llm.prefill'):.2f} tok/s`，`llm.decode` `{speed('llm.decode'):.2f} tok/s`，`TTS.infer` `{speed('tts.infer'):.2f} compute tok/s`。",
-        f"- n_past：峰值 `{max(c['n_past'] for c in chunks)}`，最终 `{chunks[-1]['n_past']}`；RSS 约 `{rss_range}`，GPU used 约 `{gpu_range}`。",
+        f"**结论：{conclusion}。** {reason}。",
         "",
-        "## 图表",
+        f"- 输入节奏：`1s/frame`；日志：`{log_path.name}`。",
+        f"- Frames：`{len(frame_rows)}`；SPEAK `{len(speak_rows)}`，LISTEN `{len(listen_rows)}`，SPEAK utterance `{len(utterances)}` 段。",
+        f"- 完整 SPEAK e2e：avg `{avg(speak_e2e):.1f} ms`，p95 `{pctl(speak_e2e, 0.95):.1f} ms`，max `{max(speak_e2e) if speak_e2e else 0.0:.1f} ms`。",
+        f"- 判定口径：从 `duplex.encode.start` 到该 SPEAK frame 最后一次 `t2w.write.end`；不统计队列等待。",
+        "",
+        "## 流水线",
         "",
         "![Omni Duplex 实测流水线](figures/omni-duplex-pipeline.svg)",
         "",
-        "![阶段耗时均值](figures/omni-duplex-stage-latency.svg)",
+        "图中只展示一个连续 SPEAK turn，并保留前后 LISTEN frame；竖线标出 1s 输入节奏。",
         "",
-        "![逐 chunk API 延迟](figures/omni-duplex-chunk-latency.svg)",
+        "## 阶段概览",
         "",
-        "![异步重叠时间线](figures/omni-duplex-overlap-timeline.svg)",
-        "",
-        "![GPU 利用率时间线](figures/omni-duplex-gpu-utilization.svg)",
-        "",
-        "完整阶段用时统计表见 [`omni-duplex-stage-timing-table.md`](omni-duplex-stage-timing-table.md)，CSV 见 `omni-duplex-stage-stats.csv`、`omni-duplex-stage-token-speed.csv`、`omni-duplex-gpu-samples.csv`、`omni-duplex-stage-gpu-stats.csv` 和 `omni-duplex-tts-token-stats.csv`。",
-        "",
-        "## 主要结论",
-        "",
-        f"1. `vision.encode` / `audio.encode` 是输入侧 encoder 口径，平均约 `{st('vision.encode'):.1f}` / `{st('audio.encode'):.1f} ms`。",
-        f"2. LLM KV prefill 在后台线程执行，平均约 `{st('llm.prefill'):.1f} ms`，平均速度 `{speed('llm.prefill'):.2f} tok/s`；API `decode` 通过 `wait.llm_prefill_done` 等待它，因此当前 decode API 不是纯采样耗时。",
-        f"3. LLM decode 平均速度 `{speed('llm.decode'):.2f} tok/s`；SPEAK chunk 的 decode 均值约 `{avg(c['decode_ms'] for c in speak):.1f} ms`，LISTEN chunk 约 `{avg(c['decode_ms'] for c in listen):.1f} ms`。",
-        f"4. TTS/T2W 是后台链路。`tts.infer` 平均约 `{st('tts.infer'):.1f} ms`、`{speed('tts.infer'):.2f} compute tok/s`，`t2w.infer` 平均约 `{st('t2w.infer'):.1f} ms`，但它们可能与后续 chunk 重叠。",
-        "5. `[DUPLEX_PERF]` 带 `seq` 后可以按 `(t_ms, seq)` 稳定排序；TTS/T2W 仍建议继续增加稳定的 `utterance_id` / `audio_chunk_id` 来做跨线程归因。",
+        "| 阶段 | 平均耗时 | p90 | 速度 |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for stage, _ in STAGE_ROWS:
+        row = stats.get(stage, {})
+        if not row:
+            continue
+        speed_text = ""
+        if stage in TOKEN_SPEED_STAGES:
+            unit = "tok/s" if stage != "tts.infer" else "TTS tok/s"
+            speed_text = f"{speed(stage):.1f} {unit}"
+        lines.append(
+            f"| `{stage_display_name(stage)}` | {row.get('avg', 0.0):.1f} ms | "
+            f"{row.get('p90', 0.0):.1f} ms | {speed_text or '-'} |"
+        )
+
+    lines += [
         "",
         "## GPU 利用率",
         "",
     ]
     if gpu_samples:
-        lines.append(f"- 解析到 `{len(gpu_samples)}` 条 `[DUPLEX_GPU]` sample，覆盖 device：`{', '.join(str(d) for d in sorted({s['device'] for s in gpu_samples}))}`。")
-        for stage in ["tts.infer", "llm.decode", "llm.prefill", "t2w.infer"]:
+        devices = ", ".join(str(d) for d in sorted({s["device"] for s in gpu_samples}))
+        lines.append(f"- GPU sample：`{len(gpu_samples)}` 条；device：`{devices}`。")
+        for stage in ["tts.infer", "t2w.infer", "duplex.llm.decode"]:
             row = gpu_stage_summary(gpu_stats, stage)
             if row:
-                lines.append(f"- `{stage}`: avg SM `{row['avg_sm']:.1f}%`, max `{row['max_sm']:.1f}%`, avg power `{row['avg_power']:.1f} W`, samples `{row['total_samples']}`, estimated `{row['estimated']}`。")
-        lines.append("- 低 SM util + 高耗时的阶段优先检查 CPU、IO、队列和同步点；`stage_gpu_busy_ms` 仅用于单阶段观察，不应跨重叠阶段相加。")
+                lines.append(f"- `{stage_display_name(stage)}`: avg SM `{row['avg_sm']:.1f}%`, max SM `{row['max_sm']:.1f}%`, avg power `{row['avg_power']:.1f} W`。")
+        lines.extend([
+            "",
+            "![GPU 利用率时间线](figures/omni-duplex-gpu-utilization.svg)",
+        ])
     elif gpu_statuses:
         reasons = ", ".join(f"{status['event']}:{status['reason']}" for status in gpu_statuses)
         lines.append(f"- 未解析到 GPU sample；状态：`{reasons}`。")
     else:
         lines.append("- 未解析到 `[DUPLEX_GPU]` sample。运行时设置 `OMNI_GPU_PROF=1` 可启用 NVML 采样。")
-    lines += [
-        "",
-        "## 阶段平均速度",
-        "",
-        "速度口径为该阶段所有 end 事件的 `compute tokens / total duration`；`llm.prefill` 的 token 包含文本控制标记 token 和音频/视觉 embedding token，`llm.decode` 包含模型采样 token 和手动 feed 的控制 token，`tts.infer` 包含 TTS 采样步数（含 EOS 等未输出 token）。",
-        "",
-        "| stage | n | tokens | total ms | tokens/s | ms/token |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for stage in TOKEN_SPEED_STAGES:
-        row = token_stats.get(stage, {})
-        display_stage = "TTS.infer" if stage == "tts.infer" else stage
-        lines.append(
-            f"| `{display_stage}` | {int(row.get('n', 0))} | {int(row.get('tokens', 0))} | "
-            f"{row.get('total_ms', 0.0):.1f} | {row.get('tokens_per_s', 0.0):.2f} | "
-            f"{row.get('ms_per_token', 0.0):.4f} |"
-        )
-    lines += [
-        "",
-        "## TTS Token 规模",
-        "",
-    ]
-    if tts_tokens_with_detail:
-        lines.append(f"- 解析到 `{len(tts_tokens_with_detail)}` 次 `tts.infer` audio token 输出；总计 `{sum(tts_audio_values)}` 个 audio token。")
-        lines.append(f"- 每次 `tts.infer` 输出 token：平均 `{avg(tts_audio_values):.1f}`，p50 `{statistics.median(tts_audio_values):.1f}`，p90 `{pctl(tts_audio_values, 0.90):.1f}`，范围 `{min(tts_audio_values)}-{max(tts_audio_values)}`。")
-        per_token = [row["ms_per_audio_token"] for row in tts_tokens_with_detail if row["ms_per_audio_token"] > 0]
-        if per_token:
-            lines.append(f"- TTS 每 audio token 成本：平均 `{avg(per_token):.2f} ms/token`，p50 `{statistics.median(per_token):.2f} ms/token`。")
-            output_total_ms = sum(row["dur_ms"] for row in tts_tokens_with_detail)
-            output_tok_s = sum(tts_audio_values) * 1000.0 / output_total_ms if output_total_ms > 0 else 0.0
-            lines.append(f"- TTS compute 速度：`{speed('tts.infer'):.2f} tok/s`；有效 audio 输出速度：`{output_tok_s:.2f} audio tok/s`（总体口径）。")
-        lines += [
-            "",
-            "| chunk | tts_chunk | dur ms | llm tokens | filtered | condition | compute tokens | audio tokens | ms/audio token | end_of_turn | flush_only |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-        for row in tts_tokens_with_detail:
-            lines.append(
-                f"| {row['chunk']} | {row['tts_chunk']} | {row['dur_ms']:.1f} | "
-                f"{row['llm_tokens']} | {row['filtered_llm_tokens']} | {row['condition_tokens']} | "
-                f"{row['compute_tokens']} | {row['audio_tokens_generated']} | {row['ms_per_audio_token']:.2f} | "
-                f"{row['is_end_of_turn']} | {row['flush_only']} |"
-            )
-    elif tts_tokens:
-        lines.append("- 当前日志里的 `tts.infer` detail 还没有 `audio_tokens_generated` 字段；请用更新后的二进制重新跑一次 benchmark 后再分析。")
-    else:
-        lines.append("- 未解析到 `tts.infer` end 事件。")
-    lines += [
-        "",
-        "## 阶段耗时表",
-        "",
-        "| type | stage | n | total ms | avg ms | p50 ms | p90 ms | max ms |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for stage, _ in STAGE_ROWS:
-        row = stats.get(stage, {})
-        lines.append(f"| `{stage_kind(stage)}` | `{stage}` | {int(row.get('n', 0))} | {row.get('total', 0):.1f} | {row.get('avg', 0):.1f} | {row.get('p50', 0):.1f} | {row.get('p90', 0):.1f} | {row.get('max', 0):.1f} |")
-    lines += [
-        "",
-        "## 计时口径说明",
-        "",
-        "- `index=0` 是 session/ref audio 初始化，不能和普通用户音频 chunk 混在一起解释。",
-        "- `api.duplex.frame_total` 是 push frame 到 result 出队的端到端 API 包络；`api.stream_prefill` 主要覆盖 encoder submit 和入队。",
-        "- 异步 LLM KV 写入体现在 `llm.prefill` 和 `wait.llm_prefill_done`；这些内部阶段不要和 API 包络相加。",
-        "- TTS/T2W 的 `chunk` 来自随队列传递的 `perf_chunk_index`；若一次 drain 多个队列项，T2W window 仍按第一个有效 chunk 标注。",
-        "- 对端到端首响、RTF 和尾包 flush 的精确测量，仍建议在 LLM enqueue、TTS audio token、T2W wav 输出之间增加同一个稳定请求 ID。",
-        "",
-        "## 结构化事件完整性",
-        "",
-        "| stage/event | count |",
-        "| --- | ---: |",
-    ]
-    for (stage, event), count in sorted(event_counts.items()):
-        lines.append(f"| `{stage}` / `{event}` | {count} |")
     lines.append("")
     write(path, "\n".join(lines))
 
@@ -867,26 +1220,24 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=Path("duplex_perf_report"))
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_report_dir(args.out_dir)
 
     text, events, chunks, gpu_samples, gpu_statuses = parse_log(args.log, args.gpu_log)
     stats = stage_stats(events)
-    tts_tokens = tts_token_rows(events)
     token_stats = stage_token_stats(events)
     intervals = build_stage_intervals(events)
-    gpu_stats = stage_gpu_stats(intervals, gpu_samples)
+    frame_rows = build_frame_summaries(events, chunks, intervals)
+    active_devices = active_gpu_ids(gpu_samples, max_devices=1)
+    focused_gpu_samples = filter_gpu_samples(gpu_samples, active_devices)
+    gpu_stats = stage_gpu_stats(intervals, focused_gpu_samples)
     figures = args.out_dir / "figures"
-    pipeline_svg(figures / "omni-duplex-pipeline.svg")
-    stage_latency_svg(figures / "omni-duplex-stage-latency.svg", stats)
-    chunk_latency_svg(figures / "omni-duplex-chunk-latency.svg", chunks)
-    overlap_svg(figures / "omni-duplex-overlap-timeline.svg", events)
-    gpu_utilization_svg(figures / "omni-duplex-gpu-utilization.svg", gpu_samples, intervals)
-    write_csvs(args.out_dir, stats, chunks, gpu_samples, gpu_stats, tts_tokens, token_stats)
-    write_stage_timing_table(args.out_dir / "omni-duplex-stage-timing-table.md", stats)
-    write_report(args.out_dir / "omni-duplex-perf-report.md", args.log, text, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, tts_tokens, token_stats)
-    print(f"parsed_events={len(events)} raw_markers={text.count('[DUPLEX_PERF]')} chunks={len(chunks)} gpu_samples={len(gpu_samples)} tts_token_rows={len(tts_tokens)}")
+    frame_pipeline_svg(figures / "omni-duplex-pipeline.svg", frame_rows, intervals)
+    gpu_utilization_svg(figures / "omni-duplex-gpu-utilization.svg", focused_gpu_samples, intervals)
+    write_report(args.out_dir / "omni-duplex-perf-report.md", args.log, text, events, chunks, stats, focused_gpu_samples, gpu_stats, gpu_statuses, token_stats, frame_rows)
+    print(f"parsed_events={len(events)} raw_markers={text.count('[DUPLEX_PERF]')} chunks={len(chunks)} frames={len(frame_rows)} gpu_samples={len(focused_gpu_samples)} active_gpus={','.join(str(d) for d in active_devices)}")
     print(f"wrote={args.out_dir / 'omni-duplex-perf-report.md'}")
-    print(f"stage_table={args.out_dir / 'omni-duplex-stage-timing-table.md'}")
-    print(f"figures={figures}")
+    print(f"pipeline={figures / 'omni-duplex-pipeline.svg'}")
+    print(f"gpu={figures / 'omni-duplex-gpu-utilization.svg'}")
 
 
 if __name__ == "__main__":

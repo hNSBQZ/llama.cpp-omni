@@ -9295,7 +9295,13 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
         const bool has_aud = !req->aud_fname.empty();
 
+        const int perf_chunk_index = req->index;
+        std::string encode_start_detail = "frame_id=" + std::to_string(perf_chunk_index) +
+                                          ",has_img=" + std::to_string(has_img ? 1 : 0) +
+                                          ",has_aud=" + std::to_string(has_aud ? 1 : 0);
         auto t_enc_begin = std::chrono::high_resolution_clock::now();
+        omni_perf_mark(ctx_omni, "duplex.encode", "start",
+                       perf_chunk_index, -1.0, encode_start_detail.c_str());
 
         // vision_set_max_slice_nums 只改 ctx_vision 的一个配置字段，不影响 ctx_audio，
         // 所以放在 VPM 任务启动之前（主线程）设置是安全的；若放 VPM 任务内部设置，
@@ -9359,6 +9365,15 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             "[prof] encoder index=%d VPM=%.1fms APM=%.1fms wall=%.1fms parallel_savings=%.1fms\n",
             req->index, vpm_ms, apm_ms, enc_wall_ms,
             (vpm_ms + apm_ms) - enc_wall_ms);
+        std::string encode_end_detail = encode_start_detail +
+                                        ",vpm_ms=" + std::to_string(vpm_ms) +
+                                        ",apm_ms=" + std::to_string(apm_ms) +
+                                        ",parallel_savings_ms=" + std::to_string((vpm_ms + apm_ms) - enc_wall_ms) +
+                                        ",vision_tokens=" + std::to_string(packet->vision_embed.empty() ? 0 : (int)(packet->vision_embed[0].size() / hidden_size)) +
+                                        ",vision_chunks=" + std::to_string(packet->vision_embed.size()) +
+                                        ",audio_tokens=" + std::to_string(hidden_size > 0 ? (int)(packet->audio_embed.size() / hidden_size) : 0);
+        omni_perf_mark(ctx_omni, "duplex.encode", "end",
+                       perf_chunk_index, enc_wall_ms, encode_end_detail.c_str());
 
         delete req;
 
@@ -9728,6 +9743,11 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
     auto t_dec_begin = ctx_omni->stream_decode_start_time;
     int  n_past_dec_0 = ctx_omni->n_past;
+    const int perf_chunk_index = round_idx;
+    std::string decode_start_detail = "frame_id=" + std::to_string(perf_chunk_index) +
+                                      ",round_idx=" + std::to_string(round_idx);
+    omni_perf_mark(ctx_omni, "duplex.llm.decode", "start",
+                   perf_chunk_index, -1.0, decode_start_detail.c_str());
 
     print_with_timestamp("Duplex decode: start, n_past=%d, n_keep=%d, n_ctx=%d\n",
                          ctx_omni->n_past, ctx_omni->n_keep, params->n_ctx);
@@ -9773,6 +9793,13 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
+        auto t_force_end = std::chrono::high_resolution_clock::now();
+        double force_ms = std::chrono::duration<double, std::milli>(t_force_end - t_dec_begin).count();
+        std::string force_detail = "frame_id=" + std::to_string(perf_chunk_index) +
+                                   ",round_idx=" + std::to_string(round_idx) +
+                                   ",tokens=0,is_speak=0,force_listen=1";
+        omni_perf_mark(ctx_omni, "duplex.llm.decode", "end",
+                       perf_chunk_index, force_ms, force_detail.c_str());
         return true;
     }
 
@@ -9928,6 +9955,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             llm_out->hidden_states   = chunk_hidden_states;
             llm_out->n_embd          = llm_n_embd;
             llm_out->is_end_of_turn  = local_is_end_of_turn;
+            llm_out->perf_chunk_index = perf_chunk_index;
 
             {
                 std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
@@ -9986,6 +10014,13 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         "[prof] llm decode n_past=%d->%d tokens=%d ms=%.1f listen=%d\n",
         n_past_dec_0, ctx_omni->n_past, ctx_omni->n_past - n_past_dec_0,
         dec_ms, (int)ctx_omni->ended_with_listen.load());
+    std::string decode_end_detail = "frame_id=" + std::to_string(perf_chunk_index) +
+                                    ",round_idx=" + std::to_string(round_idx) +
+                                    ",tokens=" + std::to_string(ctx_omni->n_past - n_past_dec_0) +
+                                    ",is_speak=" + std::to_string(ctx_omni->ended_with_listen.load() ? 0 : 1) +
+                                    ",force_listen=0";
+    omni_perf_mark(ctx_omni, "duplex.llm.decode", "end",
+                   perf_chunk_index, dec_ms, decode_end_detail.c_str());
     return true;
 }
 
@@ -10079,10 +10114,31 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                const int perf_chunk_index = packet->index;
+                const int n_past_0 = ctx_omni->n_past;
+                auto t_prefill_begin = std::chrono::high_resolution_clock::now();
+                std::string prefill_start_detail =
+                    "frame_id=" + std::to_string(perf_chunk_index) +
+                    ",mode=pending";
+                omni_perf_mark(ctx_omni, "duplex.llm.prefill", "start",
+                               perf_chunk_index, -1.0, prefill_start_detail.c_str());
+
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
-                if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
+                bool fused_ok = duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size);
+                if (!fused_ok) {
                     duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
                 }
+                auto t_prefill_end = std::chrono::high_resolution_clock::now();
+                double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_begin).count();
+                std::string prefill_end_detail =
+                    "frame_id=" + std::to_string(perf_chunk_index) +
+                    ",mode=" + (fused_ok ? std::string("fused") : std::string("fallback")) +
+                    ",n_past_before=" + std::to_string(n_past_0) +
+                    ",n_past_after=" + std::to_string(ctx_omni->n_past) +
+                    ",tokens=" + std::to_string(ctx_omni->n_past - n_past_0);
+                omni_perf_mark(ctx_omni, "duplex.llm.prefill", "end",
+                               perf_chunk_index, prefill_ms, prefill_end_detail.c_str());
+
                 delete packet;
                 dup->in_flight_prefill.fetch_sub(1);
                 dup->in_flight_cv.notify_all();
