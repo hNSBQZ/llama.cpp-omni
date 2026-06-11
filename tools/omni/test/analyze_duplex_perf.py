@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+# Duplex profiling usage:
+#   OMNI_GPU_PROF=1 \
+#   OMNI_GPU_PROF_INTERVAL_MS=20 \
+#   OMNI_GPU_PROF_DEVICES=0 \
+#   OMNI_GPU_PROF_FILE=duplex.gpu.log \
+#   ./bin/llama-omni-test-duplex \
+#     -m <model.gguf> \
+#     --omni \
+#     --test <duplex_test_case_prefix> <case_count> \
+#     --stream-interval 1000 \
+#     --ref-audio <ref_audio.wav> \
+#     -ngl 99 \
+#     -c 4096 \
+#     -o <output_dir> \
+#     2>&1 | tee duplex.log
+#
+# GPU sampling:
+#   - OMNI_GPU_PROF_DEVICES uses NVML physical GPU indexes, e.g. 0 or 0,2.
+#   - Without OMNI_GPU_PROF_DEVICES, the first CUDA_VISIBLE_DEVICES entry is sampled.
+#   - Without either variable, only device 0 is sampled.
+#
+# Analyze:
+#   python3 tools/omni/test/analyze_duplex_perf.py \
+#     --log <duplex.log> \
+#     --gpu-log <duplex.gpu.log> \
+#     --out-dir <report_dir>
 """Parse duplex omni perf logs and generate SVG/CSV/Markdown assets.
 
 This script uses only the Python standard library so it can run on the benchmark
