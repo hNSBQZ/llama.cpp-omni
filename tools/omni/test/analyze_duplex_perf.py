@@ -13,6 +13,7 @@ import csv
 import html
 import re
 import statistics
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -637,7 +638,15 @@ def pipeline_svg(path: Path):
     for x, y, w, h, title, sub, color in boxes:
         body += [f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{color}" class="box"/>', f'<text x="{x + 12}" y="{y + 20}" class="label" font-weight="700">{esc(title)}</text>', f'<text x="{x + 12}" y="{y + 38}" class="small">{esc(sub)}</text>']
     body.append('<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#29415f"/></marker></defs>')
-    for x1, y1, x2, y2 in [(415,120,505,235),(695,235,505,350),(695,350,505,465),(695,465,775,465)]:
+    for x1, y1, x2, y2 in [
+        (415, 120, 225, 235),
+        (415, 235, 505, 235),
+        (695, 235, 420, 350),
+        (570, 350, 590, 350),
+        (740, 350, 760, 350),
+        (910, 350, 505, 465),
+        (695, 465, 775, 465),
+    ]:
         body.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#29415f" stroke-width="1.8" marker-end="url(#arrow)"/>')
     body.append(f'<text x="60" y="505" class="small">• {esc("LISTEN 帧只要求 encode + LLM；SPEAK 帧 e2e 到最后一次 t2w.write.end")}</text>')
     write(path, svg_base(1180, 520, body))
@@ -748,9 +757,11 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
         "duplex.encode": 0,
         "duplex.llm.prefill": 1,
         "duplex.llm.decode": 2,
-        "tts.infer": 3,
-        "t2w.infer": 4,
-        "t2w.write": 5,
+        "tts.condition": 3,
+        "tts.prefill": 4,
+        "tts.decode": 5,
+        "t2w.infer": 6,
+        "t2w.write": 7,
     }
     row_by_frame = {row["frame_id"]: row for row in focus_rows}
 
@@ -1188,6 +1199,49 @@ def active_gpu_ids(gpu_samples, max_devices=1):
     return [device for _, device in scores[:max_devices]]
 
 
+def gpu_device_names(device_ids):
+    device_ids = sorted(set(device_ids))
+    if not device_ids:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    names = {}
+    for line in proc.stdout.splitlines():
+        if "," not in line:
+            continue
+        idx_text, name = line.split(",", 1)
+        try:
+            idx = int(idx_text.strip())
+        except ValueError:
+            continue
+        if idx in device_ids:
+            names[idx] = name.strip()
+    return names
+
+
+def gpu_device_summary(gpu_samples):
+    device_ids = sorted({sample["device"] for sample in gpu_samples})
+    if not device_ids:
+        return ""
+    names = gpu_device_names(device_ids)
+    parts = []
+    for device in device_ids:
+        name = names.get(device)
+        parts.append(f"device {device} ({name})" if name else f"device {device}")
+    return ", ".join(parts)
+
+
 def filter_gpu_samples(gpu_samples, device_ids):
     if not device_ids:
         return gpu_samples
@@ -1332,6 +1386,9 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         "",
     ]
     if gpu_samples and gpu_valid_metric_count(gpu_samples) == 0:
+        gpu_summary = gpu_device_summary(gpu_samples)
+        if gpu_summary:
+            lines.append(f"- 使用 GPU：`{gpu_summary}`。")
         lines.append(
             f"- GPU sample：`{len(gpu_samples)}` 条，但所有利用率/显存/功耗字段均为 `NA`；"
             "当前采样源未拿到有效指标，Jetson 上通常需要 `jetson_sysfs` fallback 或外部 `tegrastats`。"
@@ -1342,6 +1399,9 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         ])
     elif gpu_samples:
         devices = ", ".join(str(d) for d in sorted({s["device"] for s in gpu_samples}))
+        gpu_summary = gpu_device_summary(gpu_samples)
+        if gpu_summary:
+            lines.append(f"- 使用 GPU：`{gpu_summary}`。")
         lines.append(f"- GPU sample：`{len(gpu_samples)}` 条；device：`{devices}`。")
         for stage in ["tts.prefill", "tts.decode", "t2w.infer", "duplex.llm.decode"]:
             row = gpu_stage_summary(gpu_stats, stage)
