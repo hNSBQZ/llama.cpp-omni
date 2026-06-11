@@ -15,7 +15,9 @@
 - `duplex.encode`
 - `duplex.llm.prefill`
 - `duplex.llm.decode`
-- 既有 `tts.infer`
+- `tts.condition`
+- `tts.prefill`
+- `tts.decode`
 - 既有 `t2w.infer`
 - 既有 `t2w.write`
 
@@ -24,8 +26,19 @@
 - `duplex.encode`：encoder 线程从 `encoder_queue` 取到 `DuplexEncodeReq` 后开始，到 `DuplexPrefillPacket` 生成完成结束。
 - `duplex.llm.prefill`：LLM 线程拿到对应 `DuplexPrefillPacket` 后开始，到 fused/fallback prefill 写入 KV 完成结束。
 - `duplex.llm.decode`：LLM decode 实际开始采样时开始，到本 frame decode 结束。
-- `tts.infer`：TTS 线程拿到 `LLMOut` 后做实际 TTS 推理的时间。
+- `tts.condition`：TTS 线程拿到 `LLMOut` 后，过滤 token、构造 text embedding、projector、normalize、merge condition embedding 的时间。
+- `tts.prefill`：condition embedding 写入 TTS KV 的时间。
+- `tts.decode`：TTS 自回归采样 audio token 的时间。
 - `t2w.infer` / `t2w.write`：Token2Wav 实际窗口推理和 wav 写盘时间。
+
+现有打点逻辑：
+
+- C++ 当前只输出上述 6 个 `[DUPLEX_PERF]` stage；API 包络、queue wait、queue enqueue、旧同步 `vision.encode` / `audio.encode` / `llm.prefill` / `llm.decode` 等冗余打点已删除。
+- `duplex.encode` 从 encoder 线程取出 `DuplexEncodeReq` 后开始，到 VPM/APM 生成 `DuplexPrefillPacket` 完成结束；提交请求到 `encoder_queue` 和推送 `prefill_queue` 不单独计时。
+- `duplex.llm.prefill` 从 LLM 线程取到 `DuplexPrefillPacket` 后开始，到 fused/fallback prefill 写入 KV 完成结束；等待 packet 到达不计时。
+- `duplex.llm.decode` 覆盖本 frame 的 decode 函数主体，包括采样前少量状态准备、force-listen 分支、采样循环、文本/TTS 输出入队等尾部工作。
+- `tts.condition` / `tts.prefill` / `tts.decode` 分别对应 TTS condition 构造、TTS KV prefill、TTS 自回归 decode。TTS decode 是流式生产：自回归采样每得到一个 audio token 就先放入 `stream_buffer`，首包攒到 28 tokens 后推一次 `T2WOut`，后续每 25 tokens 推一次；如果是 `is_end_of_turn` 的 final chunk，则中途不推，最后把剩余 tokens 作为 final/flush 包一次性送给 T2W。
+- `t2w.infer` / `t2w.write` 分别覆盖 token2wav window 推理和 wav 文件写盘；T2W 线程等待 queue 数据、drain queue、组 window 的控制开销不单独计时。
 
 ### 2. 修复 frame 归因链路
 
@@ -43,7 +56,7 @@ DuplexEncodeReq.index
   -> duplex_do_decode round_idx
   -> LLMOut.perf_chunk_index
   -> T2WOut.perf_chunk_index
-  -> tts.infer / t2w.infer / t2w.write
+  -> tts.condition / tts.prefill / tts.decode / t2w.infer / t2w.write
 ```
 
 ### 3. 分析脚本收窄到 6 个阶段
@@ -54,21 +67,22 @@ DuplexEncodeReq.index
 duplex.encode
 duplex.llm.prefill
 duplex.llm.decode
-tts.infer
+tts.condition
+tts.prefill
+tts.decode
 t2w.infer
 t2w.write
 ```
 
 脚本不再展示 API、queue、wait、旧 `vision.encode`、旧 `audio.encode`、旧 `llm.prefill/decode` 等阶段。
 
-输出重点：
+默认输出重点：
 
-- `omni-duplex-frame-summary.csv`
-- `omni-duplex-sla.md`
+- `omni-duplex-perf-report.md`
 - `figures/omni-duplex-pipeline.svg`
-- `figures/omni-duplex-stage-latency.svg`
-- `figures/omni-duplex-overlap-timeline.svg`
 - `figures/omni-duplex-gpu-utilization.svg`
+
+旧的 CSV、SLA 细表、stage timing markdown、多余 SVG 会被清理，不再作为默认报告产物。主报告的“阶段概览”会展示核心 stage 的耗时，其中 `duplex.llm.prefill`、`duplex.llm.decode`、`tts.prefill`、`tts.decode` 会额外展示 SPEAK frame 的 token 数和 token 推理速度。
 
 SLA 口径：
 
@@ -88,7 +102,7 @@ cd /cache/hanqingzhe/llama.cpp-omni
 source /cache/caitianchi/install/miniconda3/etc/profile.d/conda.sh
 conda activate /cache/hanqingzhe/.conda/envs/cuda_132_clean
 
-cmake -S . -B build-cuda132-gpu-fixed -G Ninja \
+cmake -S . -B build -G Ninja \
   -DCMAKE_C_COMPILER="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-cc" \
   -DCMAKE_CXX_COMPILER="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++" \
   -DCMAKE_CUDA_COMPILER="$CONDA_PREFIX/bin/nvcc" \
@@ -97,7 +111,7 @@ cmake -S . -B build-cuda132-gpu-fixed -G Ninja \
   -DLLAMA_CURL=OFF \
   -DCMAKE_BUILD_TYPE=Release
 
-cmake --build build-cuda132-gpu-fixed --target llama-omni-test-duplex --parallel "$(nproc)"
+cmake --build build --target llama-omni-test-duplex --parallel "$(nproc)"
 ```
 
 如果运行时找不到 CUDA/cuBLAS/OpenMP 库，再补：
@@ -138,73 +152,9 @@ GPU sampler 现在默认不会遍历服务器上的所有 GPU：
 
 ```bash
 python3 /cache/hanqingzhe/llama.cpp-omni/tools/omni/test/analyze_duplex_perf.py \
-  --log /cache/hanqingzhe/llama.cpp-omni/build-cuda132-gpu-fixed/duplex_q4_k_m_full.log \
-  --gpu-log /cache/hanqingzhe/llama.cpp-omni/build-cuda132-gpu-fixed/duplex_q4_k_m_full.gpu.log \
-  --out-dir /cache/hanqingzhe/llama.cpp-omni/build-cuda132-gpu-fixed/duplex_q4_k_m_full_report
-```
-
-## 当前报告观察
-
-基于 `build-cuda132-gpu-fixed/duplex_q4_k_m_full_report`：
-
-- 总 frame：36
-- SPEAK：9
-- LISTEN：27
-- 完整 SPEAK：8
-- 不完整 SPEAK：1
-- 完整 SPEAK e2e：
-  - avg：654.9 ms
-  - p50：657.9 ms
-  - p95：831.7 ms
-  - max：898.9 ms
-
-异常点是 `frame 33`：
-
-```text
-frame_id=33
-decision=speak
-tts_ms=19.844
-t2w_infer_ms=0
-t2w_write_ms=0
-missing=t2w_infer,t2w_write
-```
-
-`omni-duplex-tts-token-stats.csv` 中对应：
-
-```text
-chunk=33
-tts_chunk=2
-llm_tokens=0
-filtered_llm_tokens=0
-condition_tokens=2
-compute_tokens=2
-audio_tokens_generated=1
-is_end_of_turn=1
-flush_only=1
-```
-
-原始日志中对应事件：
-
-```text
-chunk=33 tts.infer start:
-llm_tokens=0, filtered_llm_tokens=0, condition_tokens=0,
-compute_tokens=0, audio_tokens_generated=0,
-is_end_of_turn=1, flush_only=1
-
-chunk=33 queue.t2w.enqueue:
-tokens=1,is_final=1,is_chunk_end=0
-
-chunk=33 tts.infer end:
-condition_tokens=2, compute_tokens=2,
-audio_tokens_generated=1,
-is_end_of_turn=1, flush_only=1
-```
-
-而后续 T2W 实际事件归属为 `chunk=32`：
-
-```text
-chunk=32 t2w.infer window_tokens=28,is_last=0 -> wav_35000.wav
-chunk=32 t2w.infer window_tokens=6,is_last=1 -> wav_36000.wav
+  --log /cache/hanqingzhe/llama.cpp-omni/build/duplex_q4_k_m_1s.log \
+  --gpu-log /cache/hanqingzhe/llama.cpp-omni/build/duplex_q4_k_m_1s.gpu.log \
+  --out-dir /cache/hanqingzhe/llama.cpp-omni/build/duplex_q4_k_m_1s_report
 ```
 
 ## TTS 相关疑问
@@ -246,6 +196,50 @@ LLM 结束本轮
 
 这说明当前 T2W 归因是按一次 drain 中的“第一个有效 `perf_chunk_index`”来标记的。当多个 `T2WOut` 被合并进同一个 token buffer/window 时，后来的 `frame 33` final token 可能被合并到 `chunk=32` 的 T2W window 里。
 
+## TTS/T2W 内部分层补充
+
+严格说，`hidden_state`、LLM token embedding merge、投影、归一化、自回归采样都属于 TTS 侧，不属于 `t2w.infer`。当前打点已把原来的大包 `tts.infer` 拆成 `tts.condition`、`tts.prefill`、`tts.decode`；`t2w.infer` 只从 audio token window 开始，负责 token2wav 推理。
+
+当前 duplex TTS 路径可以细分为：
+
+```text
+LLMOut(token_ids, hidden_states)
+  -> filter_special_tokens
+  -> emb_text(token_ids) 得到 TTS text embedding
+  -> projector_semantic(hidden_states) 把 LLM hidden 投到 TTS embedding 维度
+  -> normalize_l2_per_token(projected_hidden)
+  -> merged_embedding = emb_text + normalized_projected_hidden
+  -> 拼接 condition token，例如 audio_bos / final text_eos
+  -> prefill_with_emb_tts(condition)
+  -> 自回归采样 audio tokens
+  -> enqueue T2WOut(audio_tokens)
+```
+
+其中 `projector_semantic` 当前优先走 `projector_forward()` 的 ggml 后端实现，fallback 才走旧的 CPU float 权重实现。`normalize_l2_per_token()` 仍在调用者侧单独执行；所以“投影和归一化一次算子图完成”不是当前代码的准确描述。更准确的说法是：投影可以走一次 projector graph，归一化和 merge 目前仍在 `tts_thread_func_duplex()` 里完成。
+
+TTS 生成 audio token 是自回归的。`generate_audio_tokens_local()` 先用 condition embedding 做一次 `prefill_with_emb_tts()`，随后在最多 `max_audio_tokens` 次循环里调用 `sample_tts_token()`。每采样出一个 audio token，就用 `emb_code` 查 embedding，再通过 `prefill_with_emb_tts(..., n_pos=1)` 把这个 token 喂回 TTS KV cache，继续下一步采样。duplex 模式下当前 `max_audio_tokens=26`，非 final chunk 会强制满足最小 token 数，final/end-of-turn chunk 允许更早 EOS/flush。
+
+T2W 路径则在 TTS 产出 audio tokens 之后：
+
+```text
+T2WOut(audio_tokens)
+  -> T2W 线程 drain queue
+  -> token_buffer / sliding window 组 window
+  -> token2wav_session->feed_window(window, is_last_window)
+  -> 如果产生 waveform，则写 wav 文件
+```
+
+当前 TTS/T2W 细分打点为：
+
+- `tts.condition`：`emb_text`、`projector_semantic`、`normalize`、`merge`。
+- `tts.prefill`：condition embedding 写入 TTS KV。
+- `tts.decode`：自回归 audio token 循环。
+- `t2w.window`：T2W queue drain、token buffer/window 组装。
+- `t2w.infer`：`feed_window()`。
+- `t2w.write`：wav 写盘。
+
+当前代码还有一个需要后续确认的细节：duplex 外层在构造 `merged_embeddings` 时已经追加了一次 `audio_bos_embed`，而 `generate_audio_tokens_local()` 内部也会按 Python streaming 逻辑追加 `text_eos_embed`（final 时）和 `audio_bos_embed`。这可能只是历史兼容/统计口径问题，也可能导致 condition token 计数和实际 condition 内容需要重新核对。
+
 ## 初步判断
 
 当前问题不是 T2W 凭空生成，而是两个问题叠加：
@@ -261,25 +255,28 @@ missing=t2w_infer,t2w_write
 
 但真实语义更像是：`frame 33` 是上一段 SPEAK utterance 的尾包 flush，而不是一个新的独立语音 frame。
 
-## 后续建议
+## 当前完成情况
 
-### 1. 引入 utterance_id
+### 1. 核心打点收敛
 
-仅靠 `frame_id/chunk` 很难表达 TTS/T2W 的流式尾包。建议增加独立的 `utterance_id`：
+C++ perf 日志现在只保留核心处理 stage：
 
 ```text
-SPEAK turn 开始 -> utterance_id++
-同一段语音的多个 LLMOut/TTS/T2WOut 共享 utterance_id
-flush_only final chunk 归属到当前 utterance_id
-LISTEN 或 turn end 后关闭当前 utterance
+duplex.encode
+duplex.llm.prefill
+duplex.llm.decode
+tts.condition
+tts.prefill
+tts.decode
+t2w.infer
+t2w.write
 ```
 
-这样 frame 图和 utterance 图可以分开：
+API 包络、queue wait、queue enqueue、旧同步 `vision.encode` / `audio.encode` / `llm.prefill` / `llm.decode` 等冗余 perf 调用已从代码中删除。当前报告口径就是“真实处理阶段”，不再统计队列等待。
 
-- frame 图：输入 frame 的 encode/LLM 处理。
-- utterance 图：输出语音的 TTS/T2W 处理。
+### 2. frame/utterance 报告归组
 
-当前分析脚本已先做了轻量版 `utterance_id`：连续 SPEAK frame 会被分到同一个 `utterance_id`，遇到 LISTEN 后结束当前 utterance。这个 id 只用于报告归组和聚焦 pipeline 图，不改变 C++ 运行逻辑。
+分析脚本已经实现轻量版 `utterance_id`：连续 SPEAK frame 会被分到同一个 `utterance_id`，遇到 LISTEN 后结束当前 utterance。这个 id 只用于报告归组和聚焦 pipeline 图，不改变 C++ 运行逻辑。
 
 ```text
 LISTEN LISTEN SPEAK SPEAK SPEAK LISTEN
@@ -288,39 +285,22 @@ LISTEN LISTEN SPEAK SPEAK SPEAK LISTEN
 
 聚焦版 pipeline 图会选择一个连续 SPEAK utterance，并额外带上前后最多两个 LISTEN frame，避免把 36 个 frame 全塞进图里导致看不清。
 
-### 2. 分析脚本临时修正
+### 3. 模型推理速度统计
 
-在没有 `utterance_id` 前，分析脚本可以先做保守处理：
+需要的 token 速度统计没有删。当前有两层来源：
 
-- `flush_only=1 && llm_tokens=0` 不作为新的 SPEAK frame 主体。
-- 这类 TTS flush 可以归并到最近一个已有 TTS/T2W 的 SPEAK frame。
-- SPEAK frame 完整性不要因为尾包 flush 的 chunk id 不一致而误判。
+- C++ `[DUPLEX_PERF]` end 事件：`duplex.llm.prefill`、`duplex.llm.decode`、`tts.prefill`、`tts.decode` 的 detail 中保留真实计算 token 数，并带有 `tokens_per_s` / `ms_per_token`。
+- 分析脚本：`TOKEN_SPEED_STAGES = ["duplex.llm.prefill", "duplex.llm.decode", "tts.prefill", "tts.decode"]`，会在主报告“阶段概览”里输出 SPEAK frame 的 token 数和速度列。
 
-### 3. T2W 打点细化
+速度口径：
 
-当前 `t2w.infer` 只记录一个 `perf_chunk_index`。如果一次 T2W window 包含多个 `T2WOut` 来源，建议 detail 中增加：
+- `duplex.llm.prefill`：prefill 写入 KV 的 token 数 / prefill 阶段耗时。
+- `duplex.llm.decode`：decode 阶段新增 KV token 数 / decode 阶段耗时。
+- `tts.prefill`：condition embedding 写入 TTS KV 的实际 token 数 / TTS prefill 阶段耗时。
+- `tts.decode`：TTS 自回归采样的 `compute_tokens` / TTS decode 阶段耗时。
+- `t2w.infer` / `t2w.write` 当前只展示耗时，不展示 token/s。
 
-```text
-source_chunks=31,32,33
-source_token_counts=25,25,1
-is_final_source=33
-```
-
-这样分析脚本可以判断：
-
-- 哪个 frame 贡献了 token。
-- 哪个 frame 触发了 final flush。
-- wav 文件应该归属到哪个 utterance，而不是单个 frame。
-
-## 结论
-
-当前实现已经能测量用户要求的 6 个处理阶段，但这次报告暴露了一个 TTS/T2W 流式归因问题：
-
-`frame_id` 足够描述输入侧 encode/LLM，但不够描述输出侧 TTS/T2W 的跨 frame 流式缓存和尾包 flush。
-
-下一步如果要继续精确分析 TTS/T2W，应引入 `utterance_id` 或至少在 T2W detail 中记录多来源 chunk 信息。这样才能避免把 `flush_only` 尾包误判成独立 SPEAK frame，或把 T2W 尾包错误归到前一个 frame。
-
-## 报告精简策略
+### 4. 默认报告产物
 
 面向用户的默认报告已收窄为三类输出：
 
@@ -330,17 +310,16 @@ figures/omni-duplex-pipeline.svg
 figures/omni-duplex-gpu-utilization.svg
 ```
 
-主报告开头直接给出是否支持双工：
-
-- 是否满足 `SPEAK e2e <= 1s`
-- 完整 SPEAK 数量
-- avg / p95 / max e2e
-- 判定原因
-
 随后只保留：
 
 1. 聚焦一个连续 SPEAK utterance 的 pipeline 图。
-2. 6 个核心阶段的平均耗时和速度。
+2. 核心阶段的平均耗时，以及 LLM prefill / LLM decode / TTS prefill / TTS decode 的 SPEAK token 数和 token 速度。
 3. GPU 采样摘要和 GPU 利用率图。
 
 默认不再生成或展示长 CSV、多余 SVG、SLA 细表、stage timing markdown 等面向调试的材料。需要深挖时再临时打开相关导出。
+
+## 剩余注意点
+
+当前 C++ 仍没有真实运行时 `utterance_id`，T2W window 也没有记录 `source_chunks/source_token_counts`。因此当多个 frame 的 `T2WOut` 被合并进同一个 T2W window 时，`t2w.infer` / `t2w.write` 的归因仍然使用第一个有效 `perf_chunk_index`。
+
+这不影响当前 1s SLA 主报告，但如果后续要精确分析 TTS/T2W 跨 frame 流式缓存和 final flush 归属，仍需要在 C++ detail 中补充多来源 chunk 信息。

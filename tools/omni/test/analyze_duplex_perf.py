@@ -51,19 +51,21 @@ STAGE_ROWS = [
     ("duplex.encode", "#4c78a8"),
     ("duplex.llm.prefill", "#b279a2"),
     ("duplex.llm.decode", "#e45756"),
-    ("tts.infer", "#54a24b"),
+    ("tts.condition", "#8cd17d"),
+    ("tts.prefill", "#54a24b"),
+    ("tts.decode", "#2ca02c"),
     ("t2w.infer", "#3182bd"),
     ("t2w.write", "#9e9ac8"),
 ]
 
 REQUESTED_STAGES = {stage for stage, _ in STAGE_ROWS}
-TOKEN_SPEED_STAGES = ["duplex.llm.prefill", "duplex.llm.decode", "tts.infer"]
+TOKEN_SPEED_STAGES = ["duplex.llm.prefill", "duplex.llm.decode", "tts.prefill", "tts.decode"]
 
 FRAME_STAGE_ALIASES = {
     "encode": ["duplex.encode"],
     "llm_prefill": ["duplex.llm.prefill"],
     "llm_decode": ["duplex.llm.decode"],
-    "tts": ["tts.infer"],
+    "tts": ["tts.condition", "tts.prefill", "tts.decode"],
     "t2w_infer": ["t2w.infer"],
     "t2w_write": ["t2w.write"],
 }
@@ -142,7 +144,7 @@ def token_count_for_event(event):
     detail = parse_detail(event["detail"])
     if "tokens" in detail:
         return detail_int(detail, "tokens", -1)
-    if event["stage"] == "tts.infer":
+    if event["stage"] == "tts.decode":
         return detail_int(detail, "audio_tokens_generated", -1)
     if event["stage"] == "duplex.llm.prefill":
         return detail_int(detail, "n_past_delta", -1)
@@ -254,10 +256,14 @@ def stage_stats(events):
     return stats
 
 
-def stage_token_stats(events):
+def stage_token_stats(events, speak_frame_ids=None):
+    filter_speak_frames = speak_frame_ids is not None
+    speak_frame_ids = set(speak_frame_ids or [])
     grouped = defaultdict(TokenStageAccumulator)
     for event in events:
         if event["stage"] not in TOKEN_SPEED_STAGES or event["event"] != "end" or event["dur_ms"] < 0:
+            continue
+        if filter_speak_frames and event["chunk"] not in speak_frame_ids:
             continue
         tokens = token_count_for_event(event)
         if tokens < 0:
@@ -290,7 +296,7 @@ def stage_token_stats(events):
 def tts_token_rows(events):
     rows = []
     for event in sorted(events, key=lambda item: (item["t_ms"], item.get("seq", -1))):
-        if event["stage"] != "tts.infer" or event["event"] != "end":
+        if event["stage"] != "tts.decode" or event["event"] != "end":
             continue
         detail = parse_detail(event["detail"])
         def to_int(key, default=0):
@@ -622,7 +628,9 @@ def pipeline_svg(path: Path):
         (225, 96, 190, 48, "duplex.encode", "frame -> embeddings", "#dcecff"),
         (225, 211, 190, 48, "duplex.llm.prefill", "embeddings -> KV", "#e6dcff"),
         (505, 211, 190, 48, "duplex.llm.decode", "KV -> text/hidden", "#ffd6a5"),
-        (505, 326, 190, 48, "tts.infer", "hidden -> audio tokens", "#d0f4de"),
+        (420, 326, 150, 48, "tts.condition", "hidden -> condition", "#d8f3d0"),
+        (590, 326, 150, 48, "tts.prefill", "condition -> KV", "#d0f4de"),
+        (760, 326, 150, 48, "tts.decode", "KV -> audio tokens", "#c2e8c2"),
         (505, 441, 190, 48, "t2w.infer", "audio tokens -> wav", "#cde7ff"),
         (775, 441, 190, 48, "t2w.write", "write wav", "#e6e1f2"),
     ]
@@ -645,7 +653,9 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
         "duplex.encode": "Encode",
         "duplex.llm.prefill": "LLM",
         "duplex.llm.decode": "LLM",
-        "tts.infer": "TTS",
+        "tts.condition": "TTS",
+        "tts.prefill": "TTS",
+        "tts.decode": "TTS",
         "t2w.infer": "T2W",
         "t2w.write": "T2W",
     }
@@ -728,7 +738,9 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
         "duplex.encode": -8,
         "duplex.llm.prefill": -8,
         "duplex.llm.decode": 10,
-        "tts.infer": 0,
+        "tts.condition": -8,
+        "tts.prefill": 0,
+        "tts.decode": 10,
         "t2w.infer": -8,
         "t2w.write": 10,
     }
@@ -761,7 +773,9 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
         ("duplex.encode", colors["duplex.encode"]),
         ("duplex.llm.prefill", colors["duplex.llm.prefill"]),
         ("duplex.llm.decode", colors["duplex.llm.decode"]),
-        ("tts.infer", colors["tts.infer"]),
+        ("tts.condition", colors["tts.condition"]),
+        ("tts.prefill", colors["tts.prefill"]),
+        ("tts.decode", colors["tts.decode"]),
         ("t2w.infer", colors["t2w.infer"]),
         ("t2w.write", colors["t2w.write"]),
     ]
@@ -805,12 +819,13 @@ def overlap_svg(path: Path, events, start_ms=850.0, end_ms=1400.0):
     lanes = [
         ("encode", ["duplex.encode"]),
         ("llm", ["duplex.llm.prefill", "duplex.llm.decode"]),
-        ("tts", ["tts.infer"]),
+        ("tts", ["tts.condition", "tts.prefill", "tts.decode"]),
         ("t2w", ["t2w.infer", "t2w.write"]),
     ]
     colors = {
         "duplex.encode":"#4c78a8", "duplex.llm.prefill":"#b279a2", "duplex.llm.decode":"#e45756",
-        "tts.infer":"#54a24b", "t2w.infer":"#3182bd", "t2w.write":"#9e9ac8",
+        "tts.condition":"#8cd17d", "tts.prefill":"#54a24b", "tts.decode":"#2ca02c",
+        "t2w.infer":"#3182bd", "t2w.write":"#9e9ac8",
     }
     stage_lane = {stage: lane for lane, stages in lanes for stage in stages}
     lane_y = {}
@@ -864,7 +879,7 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
     span = max(1.0, end_ms - start_ms)
     device_h = 115
     stage_top = 96 + len(device_ids) * device_h
-    height = stage_top + 220
+    height = stage_top + 270
     body = ['<rect width="1180" height="%d" fill="#ffffff"/>' % height, '<text x="40" y="42" class="title">GPU 利用率时间线</text>', '<text x="40" y="66" class="subtitle">蓝线=SM util，橙线=memory controller util；下方为主要阶段 interval</text>']
 
     def x_of(t_ms):
@@ -892,7 +907,7 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
                 body.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="1.8"/>')
 
     stage_colors = {stage: color for stage, color in STAGE_ROWS}
-    focus_stages = ["duplex.encode", "duplex.llm.prefill", "duplex.llm.decode", "tts.infer", "t2w.infer", "t2w.write"]
+    focus_stages = ["duplex.encode", "duplex.llm.prefill", "duplex.llm.decode", "tts.condition", "tts.prefill", "tts.decode", "t2w.infer", "t2w.write"]
     lane_y = {stage: stage_top + 22 + idx * 26 for idx, stage in enumerate(focus_stages)}
     body += [f'<text x="40" y="{stage_top}" class="label" font-weight="700">stage intervals</text>']
     for stage in focus_stages:
@@ -1125,7 +1140,9 @@ def stage_display_name(stage):
         "duplex.encode": "Encode",
         "duplex.llm.prefill": "LLM Prefill",
         "duplex.llm.decode": "LLM Decode",
-        "tts.infer": "TTS",
+        "tts.condition": "TTS Condition",
+        "tts.prefill": "TTS Prefill",
+        "tts.decode": "TTS Decode",
         "t2w.infer": "T2W",
         "t2w.write": "Wav Write",
     }.get(stage, stage)
@@ -1172,20 +1189,22 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         "",
         "## 阶段概览",
         "",
-        "| 阶段 | 平均耗时 | p90 | 速度 |",
-        "| --- | ---: | ---: | ---: |",
+        "| 阶段 | 平均耗时 | p90 | SPEAK tokens | SPEAK 速度 |",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
     for stage, _ in STAGE_ROWS:
         row = stats.get(stage, {})
         if not row:
             continue
         speed_text = ""
+        token_text = ""
         if stage in TOKEN_SPEED_STAGES:
-            unit = "tok/s" if stage != "tts.infer" else "TTS tok/s"
+            unit = "tok/s" if not stage.startswith("tts.") else "TTS tok/s"
             speed_text = f"{speed(stage):.1f} {unit}"
+            token_text = str(int(token_stats.get(stage, {}).get("tokens", 0)))
         lines.append(
             f"| `{stage_display_name(stage)}` | {row.get('avg', 0.0):.1f} ms | "
-            f"{row.get('p90', 0.0):.1f} ms | {speed_text or '-'} |"
+            f"{row.get('p90', 0.0):.1f} ms | {token_text or '-'} | {speed_text or '-'} |"
         )
 
     lines += [
@@ -1196,7 +1215,7 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
     if gpu_samples:
         devices = ", ".join(str(d) for d in sorted({s["device"] for s in gpu_samples}))
         lines.append(f"- GPU sample：`{len(gpu_samples)}` 条；device：`{devices}`。")
-        for stage in ["tts.infer", "t2w.infer", "duplex.llm.decode"]:
+        for stage in ["tts.prefill", "tts.decode", "t2w.infer", "duplex.llm.decode"]:
             row = gpu_stage_summary(gpu_stats, stage)
             if row:
                 lines.append(f"- `{stage_display_name(stage)}`: avg SM `{row['avg_sm']:.1f}%`, max SM `{row['max_sm']:.1f}%`, avg power `{row['avg_power']:.1f} W`。")
@@ -1224,9 +1243,10 @@ def main():
 
     text, events, chunks, gpu_samples, gpu_statuses = parse_log(args.log, args.gpu_log)
     stats = stage_stats(events)
-    token_stats = stage_token_stats(events)
     intervals = build_stage_intervals(events)
     frame_rows = build_frame_summaries(events, chunks, intervals)
+    speak_frame_ids = {row["frame_id"] for row in frame_rows if row["decision"] == "speak"}
+    token_stats = stage_token_stats(events, speak_frame_ids)
     active_devices = active_gpu_ids(gpu_samples, max_devices=1)
     focused_gpu_samples = filter_gpu_samples(gpu_samples, active_devices)
     gpu_stats = stage_gpu_stats(intervals, focused_gpu_samples)

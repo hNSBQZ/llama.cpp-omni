@@ -499,14 +499,17 @@ OmniPerfTokenStats * omni_perf_stage_stats(struct omni_context * ctx_omni, const
     if (ctx_omni == nullptr || stage == nullptr) {
         return nullptr;
     }
-    if (std::strcmp(stage, "llm.prefill") == 0) {
+    if (std::strcmp(stage, "duplex.llm.prefill") == 0) {
         return &ctx_omni->perf.llm_prefill;
     }
-    if (std::strcmp(stage, "llm.decode") == 0) {
+    if (std::strcmp(stage, "duplex.llm.decode") == 0) {
         return &ctx_omni->perf.llm_decode;
     }
-    if (std::strcmp(stage, "tts.infer") == 0) {
-        return &ctx_omni->perf.tts_infer;
+    if (std::strcmp(stage, "tts.prefill") == 0) {
+        return &ctx_omni->perf.tts_prefill;
+    }
+    if (std::strcmp(stage, "tts.decode") == 0) {
+        return &ctx_omni->perf.tts_decode;
     }
     return nullptr;
 }
@@ -579,9 +582,10 @@ void omni_perf_print_token_stats(struct omni_context * ctx_omni) {
         print_with_timestamp("[DUPLEX_PERF_SUMMARY] stage=%s calls=%lld tokens=%lld total_ms=%.3f avg_tokens_per_s=%.2f avg_ms_per_token=%.4f\n",
                              stage, stats.calls, stats.tokens, stats.duration_ms, tokens_per_s, ms_per_token);
     };
-    print_one("llm.prefill", ctx_omni->perf.llm_prefill);
-    print_one("llm.decode", ctx_omni->perf.llm_decode);
-    print_one("tts.infer", ctx_omni->perf.tts_infer);
+    print_one("duplex.llm.prefill", ctx_omni->perf.llm_prefill);
+    print_one("duplex.llm.decode", ctx_omni->perf.llm_decode);
+    print_one("tts.prefill", ctx_omni->perf.tts_prefill);
+    print_one("tts.decode", ctx_omni->perf.tts_decode);
 }
 
 void omni_perf_mark(struct omni_context * ctx_omni,

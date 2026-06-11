@@ -18,7 +18,8 @@ struct OmniPerfState {
     std::mutex token_stats_mtx;
     OmniPerfTokenStats llm_prefill;
     OmniPerfTokenStats llm_decode;
-    OmniPerfTokenStats tts_infer;
+    OmniPerfTokenStats tts_prefill;
+    OmniPerfTokenStats tts_decode;
 };
 
 bool omni_tts_debug_dump_enabled();
