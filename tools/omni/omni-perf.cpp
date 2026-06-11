@@ -257,31 +257,38 @@ public:
         return false;
 #else
         std::string reason;
-        if (!nvml.load(reason)) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"" + reason + "\"");
-            return false;
-        }
-        if (nvml.nvmlInit_v2() != OMNI_NVML_SUCCESS) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"nvml_init_failed\"");
+        if (nvml.load(reason) &&
+            nvml.nvmlInit_v2() == OMNI_NVML_SUCCESS &&
+            nvml.nvmlDeviceGetCount_v2(&device_count) == OMNI_NVML_SUCCESS &&
+            device_count > 0) {
+            using_nvml = true;
+            sample_devices = resolve_sample_devices(device_count);
+            if (sample_devices.empty()) {
+                omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"no_selected_devices\"");
+                nvml.nvmlShutdown();
+                nvml.unload();
+                using_nvml = false;
+                return false;
+            }
+        } else {
+            if (device_count > 0) {
+                nvml.nvmlShutdown();
+            }
             nvml.unload();
-            return false;
-        }
-        if (nvml.nvmlDeviceGetCount_v2(&device_count) != OMNI_NVML_SUCCESS || device_count == 0) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"nvml_no_devices\"");
-            nvml.nvmlShutdown();
-            nvml.unload();
-            return false;
-        }
-        sample_devices = resolve_sample_devices(device_count);
-        if (sample_devices.empty()) {
-            omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"no_selected_devices\"");
-            nvml.nvmlShutdown();
-            nvml.unload();
-            return false;
+            using_nvml = false;
+            device_count = 1;
+            if (!jetson_gpu_sysfs_available()) {
+                const std::string fallback_reason = reason.empty() ? "nvml_unavailable_and_jetson_sysfs_missing" : reason;
+                omni_perf_write_line("DUPLEX_GPU", "[DUPLEX_GPU] event=unavailable reason=\"" + fallback_reason + "\"");
+                return false;
+            }
+            sample_devices = {0};
         }
         {
             std::ostringstream line;
             line << "[DUPLEX_GPU] event=devices";
+            const char * source = using_nvml ? (jetson_gpu_sysfs_available() ? "nvml+jetson_sysfs" : "nvml") : "jetson_sysfs";
+            line << " source=\"" << source << "\"";
             line << " selected=\"";
             for (size_t i = 0; i < sample_devices.size(); ++i) {
                 if (i > 0) {
@@ -308,11 +315,12 @@ public:
             worker.join();
         }
 #if !defined(_WIN32)
-        if (device_count > 0) {
+        if (using_nvml && device_count > 0) {
             nvml.nvmlShutdown();
         }
         nvml.unload();
         device_count = 0;
+        using_nvml = false;
         sample_devices.clear();
 #endif
     }
@@ -357,6 +365,53 @@ private:
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(2) << (double) milliwatts / 1000.0;
         return ss.str();
+    }
+
+    static std::string fmt_na_or_double(bool ok, double value, int precision = 2) {
+        if (!ok) {
+            return "NA";
+        }
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(precision) << value;
+        return ss.str();
+    }
+
+    static bool read_double_file(const char * path, double & value) {
+        std::ifstream in(path);
+        if (!in.good()) {
+            return false;
+        }
+        double parsed = 0.0;
+        if (!(in >> parsed)) {
+            return false;
+        }
+        value = parsed;
+        return true;
+    }
+
+    static bool read_jetson_gpu_load_pct(double & value) {
+        double raw = 0.0;
+        if (!read_double_file("/sys/devices/platform/17000000.gpu/load", raw)) {
+            return false;
+        }
+        // Jetson exposes GR3D load as either percent or permille depending on BSP.
+        value = raw > 100.0 ? raw / 10.0 : raw;
+        value = std::max(0.0, std::min(100.0, value));
+        return true;
+    }
+
+    static bool read_jetson_gpu_clock_mhz(double & value) {
+        double hz = 0.0;
+        if (!read_double_file("/sys/devices/platform/17000000.gpu/devfreq/17000000.gpu/cur_freq", hz)) {
+            return false;
+        }
+        value = hz / 1000000.0;
+        return true;
+    }
+
+    static bool jetson_gpu_sysfs_available() {
+        double ignored = 0.0;
+        return read_jetson_gpu_load_pct(ignored);
     }
 
     static void append_device_if_valid(std::vector<unsigned int> & out,
@@ -438,7 +493,7 @@ private:
                 continue;
             }
             nvmlDevice_t handle = nullptr;
-            if (nvml.nvmlDeviceGetHandleByIndex_v2(device, &handle) != OMNI_NVML_SUCCESS) {
+            if (using_nvml && nvml.nvmlDeviceGetHandleByIndex_v2(device, &handle) != OMNI_NVML_SUCCESS) {
                 continue;
             }
 
@@ -449,25 +504,33 @@ private:
             unsigned int graphics_clock = 0;
             unsigned int mem_clock = 0;
 
-            const bool has_util = nvml.nvmlDeviceGetUtilizationRates(handle, &util) == OMNI_NVML_SUCCESS;
-            const bool has_mem = nvml.nvmlDeviceGetMemoryInfo(handle, &mem) == OMNI_NVML_SUCCESS;
-            const bool has_power = nvml.nvmlDeviceGetPowerUsage(handle, &power_mw) == OMNI_NVML_SUCCESS;
-            const bool has_temp = nvml.nvmlDeviceGetTemperature(handle, OMNI_NVML_TEMPERATURE_GPU, &temp_c) == OMNI_NVML_SUCCESS;
-            const bool has_graphics_clock = nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_GRAPHICS, &graphics_clock) == OMNI_NVML_SUCCESS;
-            const bool has_mem_clock = nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_MEM, &mem_clock) == OMNI_NVML_SUCCESS;
+            const bool has_util = using_nvml && nvml.nvmlDeviceGetUtilizationRates(handle, &util) == OMNI_NVML_SUCCESS;
+            const bool has_mem = using_nvml && nvml.nvmlDeviceGetMemoryInfo(handle, &mem) == OMNI_NVML_SUCCESS;
+            const bool has_power = using_nvml && nvml.nvmlDeviceGetPowerUsage(handle, &power_mw) == OMNI_NVML_SUCCESS;
+            const bool has_temp = using_nvml && nvml.nvmlDeviceGetTemperature(handle, OMNI_NVML_TEMPERATURE_GPU, &temp_c) == OMNI_NVML_SUCCESS;
+            const bool has_graphics_clock = using_nvml && nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_GRAPHICS, &graphics_clock) == OMNI_NVML_SUCCESS;
+            const bool has_mem_clock = using_nvml && nvml.nvmlDeviceGetClockInfo(handle, OMNI_NVML_CLOCK_MEM, &mem_clock) == OMNI_NVML_SUCCESS;
+
+            double jetson_load_pct = 0.0;
+            const bool has_jetson_load = !has_util && read_jetson_gpu_load_pct(jetson_load_pct);
+            double jetson_clock_mhz = 0.0;
+            const bool has_jetson_clock = !has_graphics_clock && read_jetson_gpu_clock_mhz(jetson_clock_mhz);
+            double cuda_used_mb = -1.0;
+            double cuda_total_mb = -1.0;
+            const bool has_cuda_mem = !has_mem && omni_perf_gpu_memory_mb(cuda_used_mb, cuda_total_mb);
 
             const uint64_t sample_id = next_sample_id++;
             std::ostringstream line;
             line << "[DUPLEX_GPU] sample_id=" << sample_id
                  << " t_ms=" << std::fixed << std::setprecision(3) << omni_perf_now_ms()
                  << " device=" << device
-                 << " sm_util_pct=" << fmt_na_or_int(has_util, util.gpu)
+                 << " sm_util_pct=" << (has_util ? fmt_na_or_int(true, util.gpu) : fmt_na_or_double(has_jetson_load, jetson_load_pct, 1))
                  << " mem_util_pct=" << fmt_na_or_int(has_util, util.memory)
-                 << " gpu_used_mb=" << fmt_na_or_mb(has_mem, mem.used)
-                 << " gpu_total_mb=" << fmt_na_or_mb(has_mem, mem.total)
+                 << " gpu_used_mb=" << (has_mem ? fmt_na_or_mb(true, mem.used) : fmt_na_or_double(has_cuda_mem, cuda_used_mb))
+                 << " gpu_total_mb=" << (has_mem ? fmt_na_or_mb(true, mem.total) : fmt_na_or_double(has_cuda_mem, cuda_total_mb))
                  << " power_w=" << fmt_na_or_power(has_power, power_mw)
                  << " temp_c=" << fmt_na_or_int(has_temp, temp_c)
-                 << " graphics_clock_mhz=" << fmt_na_or_int(has_graphics_clock, graphics_clock)
+                 << " graphics_clock_mhz=" << (has_graphics_clock ? fmt_na_or_int(true, graphics_clock) : fmt_na_or_double(has_jetson_clock, jetson_clock_mhz, 1))
                  << " mem_clock_mhz=" << fmt_na_or_int(has_mem_clock, mem_clock);
             omni_perf_write_line("DUPLEX_GPU", line.str());
         }
@@ -476,6 +539,7 @@ private:
     OmniNvmlLoader nvml;
     unsigned int device_count = 0;
     std::vector<unsigned int> sample_devices;
+    bool using_nvml = false;
 #endif
 
     std::atomic<bool> running{false};

@@ -684,7 +684,7 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
     body = [
         f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
         '<text x="40" y="42" class="title">Duplex Pipeline: One SPEAK Turn</text>',
-        '<text x="40" y="66" class="subtitle">竖线标记 1s 输入间隔</text>',
+        '<text x="40" y="66" class="subtitle">竖线标记 1s 输入间隔；同色细线连接同一 frame 的各阶段产物</text>',
     ]
 
     for row in focus_rows:
@@ -732,12 +732,63 @@ def frame_pipeline_svg(path: Path, frame_rows, intervals):
         "t2w.infer": -8,
         "t2w.write": 10,
     }
-    for interval in sorted(drawable, key=lambda item: (item["begin_ms"], item["chunk"], item["stage"])):
+    stage_order = {
+        "duplex.encode": 0,
+        "duplex.llm.prefill": 1,
+        "duplex.llm.decode": 2,
+        "tts.infer": 3,
+        "t2w.infer": 4,
+        "t2w.write": 5,
+    }
+    row_by_frame = {row["frame_id"]: row for row in focus_rows}
+
+    def bar_geometry(interval):
         lane = stage_lane[interval["stage"]]
         x = x_of(interval["begin_ms"])
         raw_w = (interval["end_ms"] - interval["begin_ms"]) / span * chart_w
         w = max(2.0, raw_w)
         y = lane_y[lane] - 2 + stage_offsets.get(interval["stage"], 0)
+        return {
+            "x": x,
+            "y": y,
+            "w": w,
+            "raw_w": raw_w,
+            "cx": x + w / 2.0,
+            "cy": y + 7.0,
+        }
+
+    bar_rows = [
+        (interval, bar_geometry(interval))
+        for interval in sorted(drawable, key=lambda item: (item["begin_ms"], item["chunk"], item["stage"]))
+    ]
+
+    by_frame = defaultdict(list)
+    for interval, geom in bar_rows:
+        by_frame[interval["chunk"]].append((interval, geom))
+
+    # Draw same-frame data-flow connectors before the bars so colored stage bars
+    # stay readable while overlapping SPEAK windows can still be traced.
+    for frame_id in sorted(by_frame):
+        frame_row = row_by_frame.get(frame_id, {})
+        stroke = "#2ca25f" if frame_row.get("decision") == "speak" else "#6b7280"
+        points = [
+            (geom["cx"], geom["cy"])
+            for interval, geom in sorted(
+                by_frame[frame_id],
+                key=lambda item: (stage_order.get(item[0]["stage"], 99), item[0]["begin_ms"], item[0]["end_ms"]),
+            )
+        ]
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            body.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                f'stroke="{stroke}" stroke-width="1.3" opacity="0.55"/>'
+            )
+
+    for interval, geom in bar_rows:
+        x = geom["x"]
+        y = geom["y"]
+        w = geom["w"]
+        raw_w = geom["raw_w"]
         body.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="14" '
             f'fill="{colors.get(interval["stage"], "#8b95a5")}" rx="3"/>'
@@ -853,6 +904,15 @@ def gpu_utilization_svg(path: Path, gpu_samples, intervals):
     if not gpu_samples or not device_ids:
         body = ['<rect width="1180" height="180" fill="#ffffff"/>', '<text x="40" y="42" class="title">GPU 利用率时间线</text>', '<text x="40" y="72" class="subtitle">未解析到 [DUPLEX_GPU] sample</text>']
         write(path, svg_base(width, 180, body))
+        return
+    if gpu_valid_metric_count(gpu_samples) == 0:
+        body = [
+            '<rect width="1180" height="210" fill="#ffffff"/>',
+            '<text x="40" y="42" class="title">GPU 利用率时间线</text>',
+            '<text x="40" y="72" class="subtitle">解析到了 [DUPLEX_GPU] sample，但所有 GPU 指标均为 NA</text>',
+            '<text x="40" y="104" class="small">Jetson/Orin 上 NVML 常不支持 util/memory/power 字段；请使用带 jetson_sysfs fallback 的新采样器重新运行。</text>',
+        ]
+        write(path, svg_base(width, 210, body))
         return
 
     sample_min = min(sample["t_ms"] for sample in gpu_samples)
@@ -1120,6 +1180,11 @@ def filter_gpu_samples(gpu_samples, device_ids):
     return [sample for sample in gpu_samples if sample["device"] in keep]
 
 
+def gpu_valid_metric_count(gpu_samples):
+    keys = ("sm_util_pct", "mem_util_pct", "gpu_used_mb", "power_w", "graphics_clock_mhz")
+    return sum(1 for sample in gpu_samples if any(sample.get(key, -1.0) >= 0 for key in keys))
+
+
 def stage_display_name(stage):
     return {
         "duplex.encode": "Encode",
@@ -1129,6 +1194,58 @@ def stage_display_name(stage):
         "t2w.infer": "T2W",
         "t2w.write": "Wav Write",
     }.get(stage, stage)
+
+
+FRAME_STAGE_METRICS = [
+    ("encode_ms", "Encode"),
+    ("llm_prefill_ms", "LLM Prefill"),
+    ("llm_decode_ms", "LLM Decode"),
+    ("tts_ms", "TTS"),
+    ("t2w_infer_ms", "T2W"),
+    ("t2w_write_ms", "Wav Write"),
+]
+
+
+def stage_bottleneck_note(supports_duplex, complete_speak_frames, stats):
+    if supports_duplex:
+        return ""
+
+    if complete_speak_frames:
+        avg_e2e = avg(row["e2e_ms"] for row in complete_speak_frames)
+        stage_avgs = []
+        for key, label in FRAME_STAGE_METRICS:
+            values = [row.get(key, 0.0) for row in complete_speak_frames]
+            stage_avgs.append((avg(values), key, label))
+
+        bottleneck_avg, _, bottleneck_label = max(stage_avgs, key=lambda item: item[0])
+        share = bottleneck_avg / avg_e2e * 100.0 if avg_e2e > 0 else 0.0
+
+        worst_frame = max(complete_speak_frames, key=lambda row: row["e2e_ms"])
+        worst_stage_key, worst_stage_label = max(
+            FRAME_STAGE_METRICS,
+            key=lambda item: worst_frame.get(item[0], 0.0),
+        )
+        worst_stage_ms = worst_frame.get(worst_stage_key, 0.0)
+        return (
+            f"- 瓶颈阶段：按完整 SPEAK 帧平均耗时，`{bottleneck_label}` 最长，"
+            f"avg `{bottleneck_avg:.1f} ms`，约占 SPEAK e2e 平均 `{share:.1f}%`；"
+            f"最慢 frame `f{worst_frame['frame_id']}` 的最长阶段是 `{worst_stage_label}` "
+            f"`{worst_stage_ms:.1f} ms`。"
+        )
+
+    stage_avgs = [
+        (row.get("avg", 0.0), stage_display_name(stage))
+        for stage, row in stats.items()
+        if row
+    ]
+    if not stage_avgs:
+        return "- 瓶颈阶段：缺少完整 SPEAK frame 和阶段统计，无法定位耗时最长阶段。"
+
+    bottleneck_avg, bottleneck_label = max(stage_avgs, key=lambda item: item[0])
+    return (
+        f"- 瓶颈阶段：未找到完整 SPEAK frame，退化使用全局阶段平均耗时；"
+        f"`{bottleneck_label}` 最长，avg `{bottleneck_avg:.1f} ms`。"
+    )
 
 
 def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, gpu_samples, gpu_stats, gpu_statuses, token_stats, frame_rows):
@@ -1151,6 +1268,7 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         if supports_duplex and speak_e2e
         else "存在不完整 SPEAK 帧或最慢 SPEAK e2e 超过 1s"
     )
+    bottleneck_note = stage_bottleneck_note(supports_duplex, complete_speak_frames, stats)
 
     utterances = sorted({row.get("utterance_id", 0) for row in speak_rows if row.get("utterance_id", 0) > 0})
 
@@ -1163,12 +1281,13 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         f"- Frames：`{len(frame_rows)}`；SPEAK `{len(speak_rows)}`，LISTEN `{len(listen_rows)}`，SPEAK utterance `{len(utterances)}` 段。",
         f"- 完整 SPEAK e2e：avg `{avg(speak_e2e):.1f} ms`，p95 `{pctl(speak_e2e, 0.95):.1f} ms`，max `{max(speak_e2e) if speak_e2e else 0.0:.1f} ms`。",
         f"- 判定口径：从 `duplex.encode.start` 到该 SPEAK frame 最后一次 `t2w.write.end`；不统计队列等待。",
+        *([bottleneck_note] if bottleneck_note else []),
         "",
         "## 流水线",
         "",
         "![Omni Duplex 实测流水线](figures/omni-duplex-pipeline.svg)",
         "",
-        "图中只展示一个连续 SPEAK turn，并保留前后 LISTEN frame；竖线标出 1s 输入节奏。",
+        "图中只展示一个连续 SPEAK turn，并保留前后 LISTEN frame；竖线标出 1s 输入节奏，同色细线连接同一 frame 的各阶段产物。",
         "",
         "## 阶段概览",
         "",
@@ -1193,7 +1312,16 @@ def write_report(path: Path, log_path: Path, text: str, events, chunks, stats, g
         "## GPU 利用率",
         "",
     ]
-    if gpu_samples:
+    if gpu_samples and gpu_valid_metric_count(gpu_samples) == 0:
+        lines.append(
+            f"- GPU sample：`{len(gpu_samples)}` 条，但所有利用率/显存/功耗字段均为 `NA`；"
+            "当前采样源未拿到有效指标，Jetson 上通常需要 `jetson_sysfs` fallback 或外部 `tegrastats`。"
+        )
+        lines.extend([
+            "",
+            "![GPU 利用率时间线](figures/omni-duplex-gpu-utilization.svg)",
+        ])
+    elif gpu_samples:
         devices = ", ".join(str(d) for d in sorted({s["device"] for s in gpu_samples}))
         lines.append(f"- GPU sample：`{len(gpu_samples)}` 条；device：`{devices}`。")
         for stage in ["tts.infer", "t2w.infer", "duplex.llm.decode"]:
