@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -694,6 +695,32 @@ void omni_perf_mark(struct omni_context * ctx_omni,
              << " detail=\"" << safe_detail << "\"";
     }
     omni_perf_write_line("DUPLEX_PERF", line.str());
+}
+
+OmniPerfDetail::OmniPerfDetail(std::string base) : buf(std::move(base)) {}
+
+void OmniPerfDetail::append(const char * key, const std::string & value) {
+    if (!buf.empty()) {
+        buf += ',';
+    }
+    buf += key;
+    buf += '=';
+    buf += value;
+}
+
+OmniPerfDetail & OmniPerfDetail::add_i(const char * key, long long value) {
+    append(key, std::to_string(value));
+    return *this;
+}
+
+OmniPerfDetail & OmniPerfDetail::f(const char * key, double value) {
+    append(key, std::to_string(value));
+    return *this;
+}
+
+OmniPerfDetail & OmniPerfDetail::s(const char * key, const std::string & value) {
+    append(key, value);
+    return *this;
 }
 
 OmniPerfScope::OmniPerfScope(struct omni_context * ctx_, const char * stage_, int chunk_index_, const std::string & detail_)
