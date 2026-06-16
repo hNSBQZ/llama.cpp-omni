@@ -577,7 +577,13 @@ struct common_params {
     std::string apm_model                = ""; // audio encoder GGUF
     std::string vpm_model                = ""; // vision encoder GGUF
     std::string projector_model          = ""; // projector GGUF
+    std::string tts_bin_dir              = ""; // directory containing TTS projector/token2wav assets
     bool vpm_batch_encode                = false; // batch-encode same-size vision slices (off by default; helps large/high-res images)
+
+    // VoxCPM2 TTS
+    std::string voxcpm2_base_lm      = ""; // VoxCPM2 BaseLM GGUF path
+    std::string voxcpm2_acoustic     = ""; // VoxCPM2 Acoustic GGUF path
+    int         voxcpm2_n_gpu_layers = -1; // GPU layers for VoxCPM2 (-1 = all)
 
     // Apple Neural Engine (CoreML) support
     std::string vision_coreml_model_path     = ""; // path to CoreML .mlmodelc for vision ANE
