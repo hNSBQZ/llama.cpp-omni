@@ -286,6 +286,17 @@ struct omni_context {
     // 与 ended_with_listen 不同：不在 stream_decode 开头重置，
     // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
     std::atomic<bool> slide_last_was_listen{true};
+
+    // 🔧 [双工三态] 本帧是否是 IDLE：轮次已经通过 turn_eos 结束、且本帧没有产出
+    // 任何有效 TTS token。这种帧语义上等价于 LISTEN（说完了、在等用户），
+    // 但模型并没有采样出 <|listen|>，所以 ended_with_listen 仍是 false、
+    // 会被当成 SPEAK 上报，污染 speak 轮次划分和端到端延迟统计。
+    //
+    // 判据必须看 chunk_token_ids 是否为空，*不能* 看 response 是否为空：
+    // 存在 "response 被清理成空、但确实产出了 TTS token 并合成了音频" 的帧。
+    //
+    // 每次 duplex decode 开头重置，与 ended_with_listen 同生命周期。
+    std::atomic<bool> duplex_frame_idle{false};
     
     // 🔧 [与 Python 对齐] LLM 生成结束标志
     // 当 LLM 检测到 end token 时设置为 true
@@ -565,7 +576,11 @@ struct OmniDuplexFrameResult {
     int64_t  user_seq = 0;          // 与 OmniDuplexFrame.user_seq 一致
     int64_t  frame_id = -1;         // 内部分配的递增 id（1, 2, 3, ...）
     bool     ok = false;            // false = prefill 或 decode 失败
-    bool     is_speak = false;      // false = LISTEN，true = SPEAK
+    bool     is_speak = false;      // false = LISTEN，true = SPEAK（含 IDLE，见 is_idle）
+    // 轮次已 turn_eos 结束、本帧零 TTS token 产出。此时 is_speak 仍为 true
+    // （模型没采样出 <|listen|>），但语义上等价于 LISTEN，不应计入 speak 轮次
+    // 或端到端延迟统计。真正"在说话"的判据是 is_speak && !is_idle。
+    bool     is_idle = false;
     std::string text;               // 该帧 SPEAK 时生成的文本片段（已剔除控制 token）
     int      n_past_after = 0;      // 帧处理完成时的 ctx_llama n_past（调试用）
     double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）

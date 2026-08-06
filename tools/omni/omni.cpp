@@ -4352,12 +4352,19 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
+            // OMNI_T2M_DEVICE overrides the platform default below, mirroring
+            // what OMNI_VOC_DEVICE does for the vocoder a few lines down.
+            const char * t2m_dev_env = getenv("OMNI_T2M_DEVICE");
 #ifdef GGML_USE_CANN
-            std::string device_token2mel = "cpu";
-            print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，flow_matching暂用CPU\n");
+            std::string device_token2mel = token2wav_device;
+            print_with_timestamp("Token2Wav: CANN detected, flow_matching using NPU (%s)\n", device_token2mel.c_str());
 #else
             std::string device_token2mel = token2wav_device;
 #endif
+            if (t2m_dev_env && t2m_dev_env[0]) {
+                device_token2mel = t2m_dev_env;
+                print_with_timestamp("Token2Wav: flow_matching device overridden by OMNI_T2M_DEVICE=%s\n", t2m_dev_env);
+            }
 
             // Vocoder 设备策略：
             //   CUDA: vocoder 跟随 token2wav_device（GPU），因为 CUDA kernel launch 开销低
@@ -4374,8 +4381,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 device_vocoder = token2wav_device;
                 print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
 #elif defined(GGML_USE_CANN)
-                device_vocoder = "cpu";
-                print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，vocoder暂用CPU\n");
+                device_vocoder = token2wav_device;
+                print_with_timestamp("Token2Wav: CANN detected, vocoder using NPU (%s)\n", device_vocoder.c_str());
 #else
                 device_vocoder = "cpu";
                 print_with_timestamp("Token2Wav: no GPU backend, vocoder using CPU for better performance\n");
@@ -5314,9 +5321,13 @@ struct OmniTtsStageTimer {
             std::chrono::high_resolution_clock::now() - t0).count();
         ctx_omni->speak_tts_ms_acc += ms;
         char buf[320];
+        // src_cnt：本次 TTS 属于哪一帧。duplex 下 simplex_round_idx 在每帧 decode 开始时
+        // 同步为该帧编号，而 TTS 紧跟 decode 执行（tts_queue 容量为 1，LLM 会阻塞等待），
+        // 所以这里读到的就是源帧。下游据此把 tts 耗时归到 frame 上算每包 RTF。
         snprintf(buf, sizeof(buf),
-            "{\"event\":\"tts\",\"chunk_idx\":%d,\"tts_ms\":%.3f,\"speak_tts_acc_ms\":%.3f}",
-            chunk_idx, ms, ctx_omni->speak_tts_ms_acc);
+            "{\"event\":\"tts\",\"chunk_idx\":%d,\"src_cnt\":%d,\"tts_ms\":%.3f,"
+            "\"speak_tts_acc_ms\":%.3f}",
+            chunk_idx, ctx_omni->simplex_round_idx, ms, ctx_omni->speak_tts_ms_acc);
         append_stage_timing_jsonl(ctx_omni, buf);
         print_with_timestamp("[prof] tts chunk=%d ms=%.1f\n", chunk_idx, ms);
     }
@@ -9073,7 +9084,16 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         // 原因：TTS 线程在发送 is_final 之前会递增 simplex_round_idx，导致竞态条件
         // 现在 T2WOut.round_idx 保存的是递增前的值，确保 WAV 写入正确的目录
         int effective_round_idx = (received_round_idx >= 0) ? received_round_idx : ctx_omni->simplex_round_idx;
-        
+
+        // 🔧 [wav 溯源] wav 编号基数必须用 *入队时* 捕获的轮次，而不是写盘时刻去读
+        // ctx_omni->wav_turn_base —— 后者由 LLM 线程在每帧 decode 开始时改写
+        // (duplex_do_decode 里的 "sync round_idx")，一旦 TTS/T2W 慢过一个进帧间隔，
+        // wav 就会被贴上下一帧的编号，评测再也无法把 wav 归回产生它的 frame。
+        // T2WOut.round_idx 是 TTS 线程 push 时记下的，正是我们要的那个帧号。
+        const int wav_base = ctx_omni->duplex_mode
+                                 ? (effective_round_idx * 1000)
+                                 : ctx_omni->wav_turn_base;
+
         if (!ctx_omni->duplex_mode && effective_round_idx != last_round_idx) {
             print_with_timestamp("T2W线程(C++): 轮次切换 (%d -> %d)，更新输出目录\n",
                                 last_round_idx, effective_round_idx);
@@ -9166,7 +9186,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     }
 
                     // Write WAV file
-                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(wav_base + wav_idx) + ".wav";
                     
                     const int16_t num_channels = 1;
                     const int16_t bits_per_sample = 16;
@@ -9215,16 +9235,23 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                             print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
                         }
                         print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms | queue_wait=%.1fms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
+                                            wav_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
                         {
                             ctx_omni->speak_t2w_ms_acc += t2w_ms;
                             char buf[640];
-                            const int wav_id = ctx_omni->wav_turn_base + wav_idx;
+                            const int wav_id = wav_base + wav_idx;
+                            // src_cnt / n_samples / duration_ms 让下游能直接算每包 RTF，
+                            // 不必再去读 wav 文件、也不必靠 poll 时刻猜这个 wav 属于哪一帧。
                             // tts_ms lives on event=tts from OmniTtsStageTimer; do not use queue_wait as TTS.
                             snprintf(buf, sizeof(buf),
-                                "{\"event\":\"t2w\",\"wav\":\"wav_%d.wav\",\"token2wav_ms\":%.3f,"
+                                "{\"event\":\"t2w\",\"wav\":\"wav_%d.wav\",\"src_cnt\":%d,"
+                                "\"n_samples\":%d,\"sample_rate\":%d,\"duration_ms\":%.3f,"
+                                "\"is_final\":%s,\"token2wav_ms\":%.3f,"
                                 "\"t2w_queue_wait_ms\":%.3f,\"speak_t2w_acc_ms\":%.3f}",
-                                wav_id, t2w_ms, queue_wait_ms, ctx_omni->speak_t2w_ms_acc);
+                                wav_id, effective_round_idx,
+                                (int)chunk_wav.size(), sample_rate, audio_duration * 1000.0,
+                                is_last_window ? "true" : "false", t2w_ms,
+                                queue_wait_ms, ctx_omni->speak_t2w_ms_acc);
                             append_stage_timing_jsonl(ctx_omni, buf);
                         }
                         wav_idx++;
@@ -9282,7 +9309,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         FILE* flag_file = fopen(done_flag_path.c_str(), "w");
                         if (flag_file) {
                             // 写入最后一个 wav 的编号（wav_idx - 1，因为 wav_idx 已经指向下一个）
-                            int last_wav_idx = (wav_idx > 0) ? (ctx_omni->wav_turn_base + wav_idx - 1) : 0;
+                            int last_wav_idx = (wav_idx > 0) ? (wav_base + wav_idx - 1) : 0;
                             fprintf(flag_file, "%d\n", last_wav_idx);
                             fclose(flag_file);
                             print_with_timestamp("T2W线程: 写入结束标记 %s (last_wav=%d)\n", done_flag_path.c_str(), last_wav_idx);
@@ -9899,7 +9926,9 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                              const std::string & debug_dir, int round_idx,
                              double * out_decode_ms = nullptr) {
-    // ---- 轮次同步（与老 stream_decode 对齐） ----
+    // ---- 轮次同步 ----
+    // 正常情况下帧号已经由 llm 线程从 prefill packet 的 index 设好了，这里只是给
+    // 显式传 round_idx 的调用方（perf-duplex 传 frame_id）留的覆盖入口。
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
             print_with_timestamp("Duplex decode: sync round_idx %d -> %d\n",
@@ -9918,6 +9947,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     // duplex 下 llm_generation_done 不重置（与老路径对齐）
     ctx_omni->ended_with_listen = false;
+    ctx_omni->duplex_frame_idle = false;
 
     if (ctx_omni->break_event.load()) {
         ctx_omni->break_event.store(false);
@@ -9969,6 +9999,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
     bool chunk_limit_reached         = false;
     const int llm_n_embd             = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    // 本帧是否产出过任何有效 TTS token（跨所有 chunk 批次累计）。
+    // IDLE 判据用它，而不是 response 是否为空。
+    bool produced_tts_tokens         = false;
 
     std::string response;
     for (int il = 0; il < max_tgt_len; ) {
@@ -10003,6 +10036,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                 chunk_token_ids.push_back(sampled_token);
                 chunk_hidden_states.insert(chunk_hidden_states.end(),
                                            hidden_states, hidden_states + llm_n_embd);
+                produced_tts_tokens = true;
                 jl++;
                 current_chunk_tokens++;
                 if (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens) {
@@ -10075,20 +10109,23 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
         il += total_tokens_generated;
 
-        // 清理 response 中的特殊结束 token
+        // 清理 response 中的控制 token。
+        //
+        // 必须逐个 erase，不能 "截断到第一个控制 token"：<|turn_eos|> 不在
+        // is_end_token 里（duplex 只认 LISTEN/CHUNK_EOS/CHUNK_TTS_EOS），采到它之后
+        // 循环还会继续采样，于是 response 可能长成 "<|speak|><|turn_eos|>二"。
+        // 截断会把后面的 "二" 一起丢掉，而 chunk_token_ids 是在类型判断之前收集的、
+        // 不受影响 —— 结果就是这个字照样进 TTS 合成出音频，文本侧却报空，
+        // 下游按 "空 text" 把这一帧当噪声排除掉。
         {
-            static const std::vector<std::string> end_tokens = {
-                "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
+            static const std::vector<std::string> ctrl_tokens = {
+                "<|speak|>", "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>",
                 "<|chunk_eos|>", "<|chunk_tts_eos|>"
             };
-            for (const auto & t : end_tokens) {
-                size_t p = response.find(t);
-                if (p != std::string::npos) response = response.substr(0, p);
-            }
-            size_t speak_pos = response.find("<|speak|>");
-            while (speak_pos != std::string::npos) {
-                response.erase(speak_pos, std::string("<|speak|>").length());
-                speak_pos = response.find("<|speak|>");
+            for (const auto & t : ctrl_tokens) {
+                for (size_t p = response.find(t); p != std::string::npos; p = response.find(t, p)) {
+                    response.erase(p, t.length());
+                }
             }
         }
 
@@ -10128,11 +10165,23 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         if (llm_finish) break;
     }
 
+    // ---- IDLE 判定 ----
+    // 轮次已经结束（采到过 turn_eos）且本帧一个有效 TTS token 都没产出 ——
+    // 模型已经说完在等用户了，只是没主动采样 <|listen|>。日志里表现为
+    // "turn_eos → turn_eos already flushed, skipping TTS generation"。
+    const bool frame_idle = !ctx_omni->ended_with_listen.load()
+                            && !produced_tts_tokens
+                            && ctx_omni->current_turn_ended;
+    ctx_omni->duplex_frame_idle = frame_idle;
+
     // ---- 推送轮次结束标记 ----
     {
         std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
         if (!ctx_omni->ended_with_listen) {
-            ctx_omni->text_queue.push_back("__END_OF_TURN__");
+            // __TURN_IDLE__ 是 __END_OF_TURN__ 的一个子类：SSE 侧仍然发
+            // end_of_turn=true / is_listen=false（老客户端行为不变），只是额外带一个
+            // turn_idle=true，让评测能把这种帧从 speak 统计里摘出去。
+            ctx_omni->text_queue.push_back(frame_idle ? "__TURN_IDLE__" : "__END_OF_TURN__");
         }
         ctx_omni->text_done_flag = true;
         ctx_omni->text_cv.notify_all();
@@ -10268,6 +10317,13 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                // 🔧 [帧溯源] frame 的身份在 prefill 就定了：packet->index 就是调用方
+                // 传给 /v1/stream/prefill 的 cnt。decode 请求里的 round_idx 是可选的
+                // （HTTP 客户端通常不带，退化成 -1），不能依赖它，否则 simplex_round_idx
+                // 永远停在 0，TTS/T2W 落盘时记的 src_cnt 全是 0，wav 无法归帧。
+                ctx_omni->simplex_round_idx = packet->index;
+                ctx_omni->wav_turn_base     = packet->index * 1000;
+
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
                 if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
                     duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
@@ -11622,6 +11678,7 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
 
             r.ok       = ok;
             r.is_speak = !ctx_omni->ended_with_listen.load();
+            r.is_idle  = ctx_omni->duplex_frame_idle.load();
 
             // 收集本帧文本（剔除控制 token）
             {
@@ -11629,7 +11686,8 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
                 while (!ctx_omni->text_queue.empty()) {
                     std::string piece = ctx_omni->text_queue.front();
                     ctx_omni->text_queue.pop_front();
-                    if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__") continue;
+                    if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__"
+                        || piece == "__TURN_IDLE__") continue;
                     r.text += piece;
                 }
             }

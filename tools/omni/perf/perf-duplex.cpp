@@ -89,7 +89,8 @@ struct FrameRecord {
     double  t_done_ms     = 0;  // 相对 session 时钟：result 出队时刻
     bool    ok            = false;
     bool    is_speak      = false;
-    int     speak_turn_id = -1; // 连续 SPEAK 帧共享同一 id；LISTEN 为 -1
+    bool    is_idle       = false; // 轮次已结束且本帧零 TTS token 产出（语义等价 LISTEN）
+    int     speak_turn_id = -1; // 连续 SPEAK 帧共享同一 id；IDLE / LISTEN 为 -1
     double  ms_decode     = 0;
     double  ms_total      = 0;
     int     n_past_after  = 0;
@@ -197,11 +198,13 @@ static bool write_json_report(const std::string & path,
         const auto & fr = g_perf.frames[i];
         fprintf(f,
             "    {\"user_seq\": %lld, \"frame_id\": %lld, \"t_push_ms\": %.3f, "
-            "\"t_done_ms\": %.3f, \"ok\": %s, \"is_speak\": %s, \"speak_turn_id\": %d, "
+            "\"t_done_ms\": %.3f, \"ok\": %s, \"is_speak\": %s, \"is_idle\": %s, "
+            "\"speak_turn_id\": %d, "
             "\"ms_decode\": %.3f, \"ms_total\": %.3f, \"n_past_after\": %d, "
             "\"text_len\": %d, \"text\": \"%s\"}%s\n",
             (long long)fr.user_seq, (long long)fr.frame_id, fr.t_push_ms,
             fr.t_done_ms, fr.ok ? "true" : "false", fr.is_speak ? "true" : "false",
+            fr.is_idle ? "true" : "false",
             fr.speak_turn_id, fr.ms_decode, fr.ms_total, fr.n_past_after, fr.text_len,
             json_escape(fr.text).c_str(),
             (i + 1 < g_perf.frames.size()) ? "," : "");
@@ -282,7 +285,9 @@ static void duplex_perf_run(struct omni_context * ctx_omni,
             fprintf(stderr, "[错误] frame %d 处理失败/超时\n", il + 1);
             break;
         }
-        (r.is_speak ? speak : listen)++;
+        // IDLE 帧（轮次已结束、零 TTS token）语义上等价于 LISTEN，不计入 speak
+        const bool really_speaking = r.is_speak && !r.is_idle;
+        (really_speaking ? speak : listen)++;
         sum_decode += r.ms_decode;
         sum_e2e    += r.ms_total;
         completed++;
@@ -293,6 +298,7 @@ static void duplex_perf_run(struct omni_context * ctx_omni,
         fr.t_done_ms    = now_ms();
         fr.ok           = r.ok;
         fr.is_speak     = r.is_speak;
+        fr.is_idle      = r.is_idle;
         fr.ms_decode    = r.ms_decode;
         fr.ms_total     = r.ms_total;
         fr.n_past_after = r.n_past_after;
@@ -302,7 +308,7 @@ static void duplex_perf_run(struct omni_context * ctx_omni,
             std::lock_guard<std::mutex> lk(g_perf.mtx);
             auto it = g_perf.push_ms.find(r.frame_id);
             fr.t_push_ms = (it != g_perf.push_ms.end()) ? it->second : 0.0;
-            if (r.is_speak) {
+            if (really_speaking) {
                 if (!g_perf.in_speak_turn) {
                     g_perf.cur_speak_turn_id = g_perf.next_speak_turn_id++;
                     g_perf.in_speak_turn = true;
@@ -318,7 +324,7 @@ static void duplex_perf_run(struct omni_context * ctx_omni,
 
         printf("--- Chunk %lld/%d --- decode %.1fms | e2e %.1fms | n_past %d | %s\n",
                (long long)r.user_seq, cnt, r.ms_decode, r.ms_total, r.n_past_after,
-               r.is_speak ? "<|speak|>" : "<|listen|>");
+               r.is_idle ? "<|idle|>" : (r.is_speak ? "<|speak|>" : "<|listen|>"));
     }
 
     if (producer.joinable()) producer.join();

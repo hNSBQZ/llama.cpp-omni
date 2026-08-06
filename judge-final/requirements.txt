@@ -1,0 +1,7 @@
+# Judge dependencies
+httpx>=0.24
+requests>=2.28
+numpy>=1.23
+soundfile>=0.12
+Pillow>=9.0
+websockets>=11.0

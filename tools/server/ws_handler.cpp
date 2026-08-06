@@ -999,7 +999,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                  elapsed_ms(t_request_start), 0,
                                                  turn_vision_slices)));
                         break;
-                    } else if (frag == "__END_OF_TURN__") {
+                    } else if (frag == "__END_OF_TURN__" || frag == "__TURN_IDLE__") {
                         // handled by response.done
                     } else {
                         const std::string text = sanitize_utf8_stream(utf8_pending, frag);
@@ -1177,7 +1177,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                                  elapsed_ms(t_request_start), 0,
                                                  turn_vision_slices)));
                         break; // Done for this input
-                    } else if (frag == "__END_OF_TURN__") {
+                    } else if (frag == "__END_OF_TURN__" || frag == "__TURN_IDLE__") {
                         // Turn ended — will be handled by response.done
                     } else {
                         // Text delta

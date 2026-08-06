@@ -5725,14 +5725,18 @@ int main(int argc, char ** argv) {
                             {"is_listen", true},
                             {"end_of_turn", true}
                         };
-                    } else if (frag == "__END_OF_TURN__") {
-                        // 轮次结束标记
+                    } else if (frag == "__END_OF_TURN__" || frag == "__TURN_IDLE__") {
+                        // 轮次结束标记。__TURN_IDLE__ 额外表示"轮次已结束且本帧零产出"，
+                        // 对客户端的 is_listen/end_of_turn 语义与 __END_OF_TURN__ 相同。
                         ev = {
                             {"content", ""},
                             {"stop", true},
                             {"is_listen", false},
                             {"end_of_turn", true}
                         };
+                        if (frag == "__TURN_IDLE__") {
+                            ev["turn_idle"] = true;
+                        }
                     } else {
                         // 普通文本内容
                         ev = {

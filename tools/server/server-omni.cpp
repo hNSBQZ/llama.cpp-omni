@@ -360,6 +360,12 @@ int main(int argc, char ** argv) {
                         json ev;
                         if (frag == "__IS_LISTEN__") {
                             ev = {{"content", ""}, {"stop", false}, {"is_listen", true}, {"end_of_turn", true}};
+                        } else if (frag == "__TURN_IDLE__") {
+                            // 轮次已 turn_eos 结束、本帧零 TTS token 产出：语义上等价于
+                            // LISTEN。为了不破坏老客户端，is_listen/end_of_turn 保持与
+                            // __END_OF_TURN__ 一致，只额外带一个 turn_idle 标志。
+                            ev = {{"content", ""}, {"stop", true}, {"is_listen", false},
+                                  {"end_of_turn", true}, {"turn_idle", true}};
                         } else if (frag == "__END_OF_TURN__") {
                             ev = {{"content", ""}, {"stop", true}, {"is_listen", false}, {"end_of_turn", true}};
                         } else {

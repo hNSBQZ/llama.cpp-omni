@@ -1,0 +1,9 @@
+.venv/
+.venv-plot/
+tmp/runs/*
+!tmp/runs/.gitkeep
+sessions/*/
+!sessions/.gitkeep
+__pycache__/
+*.pyc
+
