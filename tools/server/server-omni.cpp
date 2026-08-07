@@ -188,6 +188,16 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Sampling knobs must land in params BEFORE omni_init: it builds the LLM and
+        // TTS samplers from params->sampling, so anything applied afterwards silently
+        // misses them and only affects the per-chunk samplers created later.
+        if (data.contains("temperature") && data.at("temperature").is_number()) {
+            params.sampling.temp = data.at("temperature").get<float>();
+        }
+        if (data.contains("seed") && data.at("seed").is_number_integer()) {
+            params.sampling.seed = data.at("seed").get<uint32_t>();
+        }
+
         omni_context * octx = omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers,
                                          token2wav_device, duplex_mode,
                                          /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
@@ -214,13 +224,6 @@ int main(int argc, char ** argv) {
         if (data.contains("tts_temperature") && data.at("tts_temperature").is_number()) {
             octx->tts_temperature = data.at("tts_temperature").get<float>();
         }
-        if (data.contains("temperature") && data.at("temperature").is_number()) {
-            params.sampling.temp = data.at("temperature").get<float>();
-        }
-        if (data.contains("seed") && data.at("seed").is_number_integer()) {
-            params.sampling.seed = data.at("seed").get<uint32_t>();
-        }
-
         LOG_INF("omni_init: listen_prob_scale=%.3f force_listen_count=%d temp=%.3f seed=%u\n",
                 octx->listen_prob_scale, octx->force_listen_count, params.sampling.temp,
                 (unsigned) params.sampling.seed);

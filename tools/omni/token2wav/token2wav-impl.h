@@ -2277,6 +2277,11 @@ struct Token2WavSession {
                                  float               temperature         = 1.0f,
                                  const std::string & coreml_model_path  = "");
 
+    // 仅更换示例音频（prompt bundle）而不重新加载模型：reset 流式状态后重新 start_stream。
+    // 供 omni-tts-eval.cpp 逐条切换参考音频使用（原 diff-master.patch 内容）。
+    bool switch_prompt_bundle(const std::string & prompt_bundle_dir,
+                              int n_timesteps = 10, float temperature = 1.0f);
+
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
     bool feed_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & wave_bt_out) {

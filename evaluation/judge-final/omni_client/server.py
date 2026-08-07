@@ -23,6 +23,22 @@ from judge_support import display_path  # noqa: E402
 logger = logging.getLogger("omni_client.server")
 
 
+def sampler_seed() -> int:
+    """采样种子。固定值，让同一份构建重复跑得到同一条 token 轨迹。
+
+    默认 42，OMNI_SAMPLER_SEED 可覆盖。omni_init 请求里的 seed 也读这个函数，
+    两处必须一致：--seed 决定 omni_init 建的那对 sampler，请求里的 seed 是
+    server 重新 omni_init 时用的。
+    """
+    raw = os.environ.get("OMNI_SAMPLER_SEED", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("OMNI_SAMPLER_SEED=%r 不是整数，退回 42", raw)
+    return 42
+
+
 def find_server_binary(llamacpp_root: str) -> str:
     """定位 omni server 二进制。
 
@@ -117,7 +133,7 @@ class CppServerProcess:
             "--temp",
             "0.7",
             "--seed",
-            "42",
+            str(sampler_seed()),
         ]
 
         logger.info(

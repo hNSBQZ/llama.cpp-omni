@@ -95,6 +95,14 @@ def run_step(
 
 def base_env(extra: Dict[str, str]) -> Dict[str, str]:
     env = os.environ.copy()
+    # 采样种子：EVAL_SEED 是唯一旋钮，这里翻译成四条流水线各自认的变量名。
+    #   SAMPLER_SEED       videomme / daily-omni 的 eval_cpp_config.py
+    #   SEED               tts 的 run_tts_eval_cpp_zh.sh → generate_cpp.py --seed
+    #   OMNI_SAMPLER_SEED  rts 的 judge-final（--seed 与 omni_init 的 seed 字段）
+    seed = cfg("EVAL_SEED", "42")
+    env.setdefault("SAMPLER_SEED", seed)
+    env.setdefault("SEED", seed)
+    env.setdefault("OMNI_SAMPLER_SEED", seed)
     env.update({k: v for k, v in extra.items() if v is not None})
     return env
 
@@ -497,8 +505,7 @@ def reextract(name: str, run_dir: Path, metrics: Dict[str, Any]) -> Dict[str, An
 def summarize_only(run_dir: Path) -> int:
     """读 run_dir 下各任务的 metrics_*.json，重新抽一遍指标再打总表。
 
-    run_all.sh 是分四批调用本脚本的（每批之间要换 patch 重编译），
-    所以总表由这一步统一出。
+    run_all.sh 是逐个任务调用本脚本的，所以总表由这一步统一出。
     """
     results: Dict[str, Dict[str, Any]] = {}
     for name in TASKS:

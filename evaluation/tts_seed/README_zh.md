@@ -6,7 +6,6 @@
 
 ```bash
 cd /path/to/llama.cpp-omni
-git apply /path/to/MiniCPM-V-CookBook/evaluation/tts_seed/llama-omni-tts-eval.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-tts-eval -j
 

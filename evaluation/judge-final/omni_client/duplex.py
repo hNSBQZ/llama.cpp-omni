@@ -21,7 +21,7 @@ if str(_JUDGE_ROOT) not in sys.path:
 from judge_support import display_path  # noqa: E402
 
 from . import media, prompts, wav_poller
-from .server import CppServerProcess
+from .server import CppServerProcess, sampler_seed
 
 logger = logging.getLogger("omni_client.duplex")
 
@@ -218,7 +218,7 @@ class DuplexSession:
             "tts_gpu_layers": 100,
             "token2wav_device": "gpu:0",
             "output_dir": self._output_dir,
-            "seed": 42,
+            "seed": sampler_seed(),
         }
 
         if self.ref_audio_path and os.path.exists(self.ref_audio_path):
@@ -234,10 +234,11 @@ class DuplexSession:
             self._last_lang = lang
 
         logger.info(
-            "Calling omni_init: media_type=%s duplex=%s lang=%s seed=42",
+            "Calling omni_init: media_type=%s duplex=%s lang=%s seed=%s",
             media_type,
             duplex_mode,
             effective_lang,
+            req_body["seed"],
         )
         resp = self._http.post(
             f"{self._cpp_server_url}/v1/stream/omni_init",

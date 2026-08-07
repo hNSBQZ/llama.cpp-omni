@@ -107,6 +107,49 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# ==============================================================================
+# 精度评测 CLI ×3 —— 供 evaluation/ 下的流水线驱动，见 evaluation/README.md
+#
+#   llama-omni-eval-cli        Video-MME    JSONL over stdin/stdout，逐题送视频帧
+#   llama-omni-eval-daily-cli  Daily-Omni   同上，帧与音频段交错
+#   llama-omni-tts-eval        Seed-TTS     TSV manifest 驱动，teacher-forced 合成
+#
+# 三个都是常驻进程：模型只加载一次，Python 侧把成百上千条样本喂进同一个进程，
+# 每卡一个。三者互不依赖，可以同时编译。
+# ==============================================================================
+
+# Video-MME 评测 CLI - pipe 驱动的批量多模态推理
+set(TARGET_EVAL_CLI llama-omni-eval-cli)
+add_executable         (${TARGET_EVAL_CLI} omni-eval-cli.cpp)
+set_target_properties  (${TARGET_EVAL_CLI} PROPERTIES OUTPUT_NAME llama-omni-eval-cli)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET_EVAL_CLI} RUNTIME)
+endif()
+target_link_libraries  (${TARGET_EVAL_CLI} PRIVATE llama-common omni Threads::Threads)
+target_include_directories(${TARGET_EVAL_CLI} PRIVATE ../../vendor)
+target_compile_features(${TARGET_EVAL_CLI} PRIVATE cxx_std_17)
+
+# Daily-Omni 评测 CLI - 视频帧与音频段交错的批量多模态推理
+set(TARGET_EVAL_DAILY_CLI llama-omni-eval-daily-cli)
+add_executable         (${TARGET_EVAL_DAILY_CLI} omni-eval-daily-cli.cpp)
+set_target_properties  (${TARGET_EVAL_DAILY_CLI} PROPERTIES OUTPUT_NAME llama-omni-eval-daily-cli)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET_EVAL_DAILY_CLI} RUNTIME)
+endif()
+target_link_libraries  (${TARGET_EVAL_DAILY_CLI} PRIVATE llama-common omni Threads::Threads)
+target_include_directories(${TARGET_EVAL_DAILY_CLI} PRIVATE ../../vendor)
+target_compile_features(${TARGET_EVAL_DAILY_CLI} PRIVATE cxx_std_17)
+
+# TTS 评测 CLI - manifest(TSV) 驱动的批量 seed-tts-eval 语音克隆推理
+set(TARGET_TTS_EVAL llama-omni-tts-eval)
+add_executable         (${TARGET_TTS_EVAL} omni-tts-eval.cpp)
+set_target_properties  (${TARGET_TTS_EVAL} PROPERTIES OUTPUT_NAME llama-omni-tts-eval)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET_TTS_EVAL} RUNTIME)
+endif()
+target_link_libraries  (${TARGET_TTS_EVAL} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_TTS_EVAL} PRIVATE cxx_std_17)
+
 # 单工模式 - 纯音频测试（批量 prefill + 单次 decode）
 set(TARGET_SINGLE_TEST_AUDIO llama-omni-single-test-audio)
 add_executable         (${TARGET_SINGLE_TEST_AUDIO} test/single_test_audio.cpp)

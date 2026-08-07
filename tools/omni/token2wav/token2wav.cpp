@@ -63,6 +63,23 @@ bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
     return true;
 }
 
+bool Token2WavSession::switch_prompt_bundle(const std::string & prompt_bundle_dir,
+                                            int n_timesteps, float temperature) {
+    // 仅更换示例音频：先 reset 流式状态（清 pending + flow-matching/vocoder 缓存），
+    // 再用新的 prompt bundle 重新 start_stream。不重新加载模型。
+    reset();
+    Token2Mel::PromptBundle pb;
+    if (!Token2Mel::load_prompt_bundle_dir(prompt_bundle_dir, pb)) {
+        fprintf(stderr, "Token2WavSession: failed to load prompt bundle from %s\n", prompt_bundle_dir.c_str());
+        return false;
+    }
+    if (!t2w.start_stream_with_prompt(pb, n_timesteps, temperature)) {
+        fprintf(stderr, "Token2WavSession: failed to start stream with new prompt bundle\n");
+        return false;
+    }
+    return true;
+}
+
 bool Token2WavSession::feed_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,

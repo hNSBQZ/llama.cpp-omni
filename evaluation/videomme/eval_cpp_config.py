@@ -55,12 +55,16 @@ MAX_FPS = 1.0
 MAX_SLICE_NUMS = 0
 MAX_TOKENS = 100          # 每题最多生成 token 数（CLI --n-predict）
 
-# 解码策略：当前 TEMPERATURE=0.0 为 greedy（对齐 Python do_sample=False）
-# 若需开启 sampling，将 TEMPERATURE 改为 > 0（如 0.2）
+# 解码策略：TEMPERATURE > 0 是 sampling，改成 0 则退化为 greedy（对齐 Python
+# do_sample=False）。保持 sampling 的前提是 seed 必须固定，否则同一份构建每次跑
+# 出的准确率都不一样，没法用来判断改动的好坏。
 TEMPERATURE = 0.2
 TOP_P = 0.8
 TOP_K = 100
 REPEAT_PENALTY = 1.02
+
+# 采样种子。固定值让重复跑得到同一条 token 轨迹；具体取几无所谓，别是随机的。
+SAMPLER_SEED = int(os.environ.get("SAMPLER_SEED", "42"))
 
 # 注：CLI 侧固定 media_type=2（audio+vision）、use_tts=false，无需从这里配置。
 

@@ -35,7 +35,7 @@ from typing import List, Optional
 from eval_cpp_config import (
     LLAMA_CLI_BIN, LLM_MODEL_PATH, CTX_SIZE,
     MAX_SLICE_NUMS, MAX_TOKENS,
-    TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY,
+    TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY, SAMPLER_SEED,
     CLI_STARTUP_TIMEOUT, INFER_TIMEOUT,
 )
 
@@ -109,6 +109,7 @@ class OmniCliClient:
             "--top-p", str(TOP_P),
             "--top-k", str(TOP_K),
             "--repeat-penalty", str(REPEAT_PENALTY),
+            "--seed", str(SAMPLER_SEED),
         ]
 
         if log_dir is None:

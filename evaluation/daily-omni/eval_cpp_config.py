@@ -63,6 +63,10 @@ TOP_P = 0.8
 TOP_K = 100
 REPEAT_PENALTY = 1.02
 
+# 采样种子。固定值让重复跑得到同一条 token 轨迹；具体取几无所谓，别是随机的。
+# 这个任务 temp=0.7 比 Video-MME 高，不固定的话准确率波动会更明显。
+SAMPLER_SEED = int(os.environ.get("SAMPLER_SEED", "42"))
+
 # 注：CLI 侧固定 media_type=2（audio+vision）、use_tts=false，无需从这里配置。
 
 # ==================== Prompt 模板（对齐 omni_generation_configs_nosys_interleave.json）====================

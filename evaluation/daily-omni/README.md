@@ -10,11 +10,10 @@ Install Python dependencies:
 pip install pandas python-dotenv decord Pillow soundfile
 ```
 
-Apply [llama-omni-eval-daily-cli.patch](llama-omni-eval-daily-cli.patch) to a compatible `llama.cpp-omni` checkout, then build its target:
+Build the `llama-omni-eval-daily-cli` target from a compatible `llama.cpp-omni` checkout:
 
 ```bash
 cd /path/to/llama.cpp-omni
-git apply /path/to/MiniCPM-V-CookBook/evaluation/daily-omni/llama-omni-eval-daily-cli.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-eval-daily-cli -j
 ```

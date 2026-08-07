@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # MiniCPM-o 评测套件 —— 一条命令跑完四个任务。
 #
-# 三个精度测试各自依赖一个不在主干里的 CLI target，由同目录下的 patch 引入，
-# 而三个 patch 都改 tools/omni/CMakeLists.txt 的同一处，不能同时打。所以本脚本
-# 对每个任务走一遍：
+# 四个任务各依赖一个 CMake target，都在主干里，不需要打补丁：
 #
-#     打补丁 → 编译该 target → 跑测试 → 撤补丁
+#     videomme   → llama-omni-eval-cli
+#     daily-omni → llama-omni-eval-daily-cli
+#     tts        → llama-omni-tts-eval
+#     rts        → llama-omni-server
 #
-# RTS 用主干的 llama-omni-server，不需要补丁，只在最后确保它是最新的。
-# 四个任务的产物收进同一个 output/<时间戳>/，最后统一打印数值汇总。
+# 本脚本先把要用到的 target 一次编出来，再依次跑测试。四个任务的产物收进同一个
+# output/<时间戳>/，最后统一打印数值汇总。
 #
 # 用法:
 #   ./run_all.sh                       # 按 config.env 的 SMOKE_* 跑
@@ -16,8 +17,7 @@
 #   ./run_all.sh --full                # 精度测试跑全量
 #   ./run_all.sh --tasks videomme,rts  # 只跑指定任务
 #   ./run_all.sh --devices 0,1,2,3     # 指定用哪几张卡
-#   ./run_all.sh --no-build            # 补丁已打好且编译过，跳过编译
-#   ./run_all.sh --keep-patch          # 跑完不撤补丁（调试用）
+#   ./run_all.sh --no-build            # 已编译过，跳过编译
 set -uo pipefail
 
 SUITE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,6 @@ export EVAL_SUITE_ROOT="$SUITE_ROOT"
 # ---------------------------------------------------------------- 参数
 TASKS="videomme,daily-omni,tts,rts"
 DO_BUILD=1
-KEEP_PATCH=0
 PASS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -34,9 +33,8 @@ while [[ $# -gt 0 ]]; do
     --tasks)       TASKS="$2"; shift 2 ;;
     --tasks=*)     TASKS="${1#*=}"; shift ;;
     --no-build)    DO_BUILD=0; shift ;;
-    --keep-patch)  KEEP_PATCH=1; shift ;;
     -h|--help)
-      sed -n '/^# MiniCPM-o/,/^# *--keep-patch/p' "${BASH_SOURCE[0]}" \
+      sed -n '/^# MiniCPM-o/,/^# *--no-build/p' "${BASH_SOURCE[0]}" \
         | sed 's/^#\{1,\} \{0,1\}//'
       echo
       echo "其余参数原样透传给 run_eval.sh，见 ./run_eval.sh --help"
@@ -75,39 +73,16 @@ RUN_DIR="$SUITE_ROOT/output/$STAMP"
 mkdir -p "$RUN_DIR"
 BUILD_LOG="$RUN_DIR/build.log"
 
-# task -> "patch 相对路径:cmake target"
-declare -A TASK_PATCH=(
-  [videomme]="videomme/llama-omni-eval-cli.patch:llama-omni-eval-cli"
-  [daily-omni]="daily-omni/llama-omni-eval-daily-cli.patch:llama-omni-eval-daily-cli"
-  [tts]="tts_seed/llama-omni-tts-eval.patch:llama-omni-tts-eval"
-  [rts]=":llama-omni-server"
+# task -> cmake target
+declare -A TASK_TARGET=(
+  [videomme]="llama-omni-eval-cli"
+  [daily-omni]="llama-omni-eval-daily-cli"
+  [tts]="llama-omni-tts-eval"
+  [rts]="llama-omni-server"
 )
 
 log()  { printf '\n\033[1;36m[run_all]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[run_all]\033[0m %s\n' "$*" >&2; }
-
-# 当前生效的补丁，异常退出时用来兜底撤回
-CURRENT_PATCH=""
-CURRENT_NEWFILE=""
-
-revert_patch() {
-  local patch="$1" newfile="$2"
-  [[ -z "$patch" ]] && return 0
-  if git -C "$REPO" apply -R "$patch" 2>/dev/null; then
-    [[ -n "$newfile" ]] && rm -f "$REPO/$newfile"
-    log "已撤回补丁 $(basename "$patch")"
-  else
-    warn "撤回补丁失败：$patch —— 手动检查 git -C $REPO status tools/"
-  fi
-  CURRENT_PATCH=""; CURRENT_NEWFILE=""
-}
-
-cleanup() {
-  local rc=$?
-  [[ $KEEP_PATCH -eq 0 ]] && revert_patch "$CURRENT_PATCH" "$CURRENT_NEWFILE"
-  exit $rc
-}
-trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- 开场
 cat <<EOF
@@ -123,87 +98,57 @@ $(printf '=%.0s' {1..78})
 $(printf '=%.0s' {1..78})
 EOF
 
-if ! git -C "$REPO" diff --quiet -- tools/omni 2>/dev/null; then
-  warn "tools/omni 已有未提交改动，可能是上次跑完没撤干净的补丁："
-  git -C "$REPO" status --short -- tools/omni >&2
-  warn "先处理掉再跑，否则打补丁会失败。"
-  exit 2
-fi
-
-# ---------------------------------------------------------------- 主循环
+# ---------------------------------------------------------------- 任务清单
 declare -a DONE_TASKS=()
 declare -a FAILED_TASKS=()
+declare -a RUN_TASKS=()
 
 IFS=',' read -r -a TASK_ARR <<< "$TASKS"
 for task in "${TASK_ARR[@]}"; do
   task="$(echo "$task" | xargs)"
   [[ -z "$task" ]] && continue
-  if [[ -z "${TASK_PATCH[$task]:-}" && "$task" != "rts" ]]; then
+  if [[ -z "${TASK_TARGET[$task]:-}" ]]; then
     warn "未知任务 $task，跳过"
     continue
   fi
+  RUN_TASKS+=("$task")
+done
 
-  spec="${TASK_PATCH[$task]}"
-  patch_rel="${spec%%:*}"
-  target="${spec##*:}"
-  patch_abs=""
-  newfile=""
-  [[ -n "$patch_rel" ]] && patch_abs="$SUITE_ROOT/$patch_rel"
+if [[ ${#RUN_TASKS[@]} -eq 0 ]]; then
+  warn "没有可跑的任务"
+  exit 2
+fi
 
+# ---------------------------------------------------------------- 编译
+# 四个 target 互不冲突，一次 configure 全部编出来，不必每个任务重来一遍。
+if [[ $DO_BUILD -eq 1 ]]; then
+  declare -a BUILD_TARGETS=()
+  for task in "${RUN_TASKS[@]}"; do
+    BUILD_TARGETS+=("${TASK_TARGET[$task]}")
+  done
+  log "编译 ${BUILD_TARGETS[*]} (-j $JOBS)"
+  {
+    echo "===== $(date '+%F %T') build ${BUILD_TARGETS[*]} ====="
+    cmake -B "$REPO/$BUILD_DIR" -S "$REPO" "${CMAKE_FLAGS[@]}" &&
+    cmake --build "$REPO/$BUILD_DIR" --target "${BUILD_TARGETS[@]}" -j "$JOBS"
+  } >> "$BUILD_LOG" 2>&1
+  if [[ $? -ne 0 ]]; then
+    warn "编译失败，见 $BUILD_LOG"
+    tail -20 "$BUILD_LOG" >&2
+    exit 3
+  fi
+  log "编译完成"
+fi
+
+# ---------------------------------------------------------------- 主循环
+for task in "${RUN_TASKS[@]}"; do
   log "===== $task ====="
-
-  # --- 1) 打补丁 ---
-  if [[ -n "$patch_abs" ]]; then
-    if [[ ! -f "$patch_abs" ]]; then
-      warn "$task: 找不到补丁 $patch_abs，跳过"
-      FAILED_TASKS+=("$task(缺补丁)")
-      continue
-    fi
-    # 补丁新建的源文件，撤回时要一并删掉（git apply -R 不删 untracked 文件）
-    newfile="$(grep -m1 '^+++ b/tools/omni/.*\.cpp$' "$patch_abs" | sed 's|^+++ b/||')"
-    log "$task: 打补丁 $(basename "$patch_abs")"
-    if ! git -C "$REPO" apply "$patch_abs" 2>&1 | tee -a "$BUILD_LOG"; then
-      warn "$task: 打补丁失败，跳过"
-      FAILED_TASKS+=("$task(打补丁失败)")
-      continue
-    fi
-    CURRENT_PATCH="$patch_abs"; CURRENT_NEWFILE="$newfile"
-  fi
-
-  # --- 2) 编译 ---
-  if [[ $DO_BUILD -eq 1 ]]; then
-    log "$task: 编译 $target (-j $JOBS)"
-    {
-      echo "===== $(date '+%F %T') build $target ====="
-      cmake -B "$REPO/$BUILD_DIR" -S "$REPO" "${CMAKE_FLAGS[@]}"
-      cmake --build "$REPO/$BUILD_DIR" --target "$target" -j "$JOBS"
-    } >> "$BUILD_LOG" 2>&1
-    if [[ $? -ne 0 ]]; then
-      warn "$task: 编译失败，见 $BUILD_LOG"
-      tail -20 "$BUILD_LOG" >&2
-      revert_patch "$CURRENT_PATCH" "$CURRENT_NEWFILE"
-      FAILED_TASKS+=("$task(编译失败)")
-      continue
-    fi
-    log "$task: $target 编译完成"
-  fi
-
-  # --- 3) 跑测试 ---
-  log "$task: 开跑"
   "$SUITE_ROOT/run_eval.sh" "$task" --run-dir "$RUN_DIR" --keep-going "${PASS_ARGS[@]}"
   rc=$?
   if [[ $rc -eq 0 ]]; then
     DONE_TASKS+=("$task")
   else
     FAILED_TASKS+=("$task(rc=$rc)")
-  fi
-
-  # --- 4) 撤补丁 ---
-  if [[ $KEEP_PATCH -eq 0 ]]; then
-    revert_patch "$CURRENT_PATCH" "$CURRENT_NEWFILE"
-  else
-    log "$task: --keep-patch，补丁保留"
-    CURRENT_PATCH=""; CURRENT_NEWFILE=""
   fi
 done
 

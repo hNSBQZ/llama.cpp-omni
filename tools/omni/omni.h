@@ -637,7 +637,22 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
 // - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
 // - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
 // - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false, bool is_final_text_chunk = false);
+
+// ==================== TTS Eval 辅助函数声明 ====================
+// 从 omni.cpp 暴露的函数，供 omni-tts-eval.cpp 使用（原 diff-master.patch 内容，
+// 随框架重构重新导出：仅去掉 static，默认参数保留在此声明中）
+bool eval_tokens(struct omni_context* ctx_omni, common_params* params,
+                 std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false);
+bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params,
+                             std::vector<llama_token> tokens, int n_batch,
+                             int * n_past, float *& hidden_states);
+bool tts_emb_text(struct omni_context* ctx_omni, llama_token token_id,
+                  float * embedding_out, int tts_n_embd);
+bool tts_projector_semantic(struct omni_context* ctx_omni, const float * hidden,
+                            int n_tokens, int llm_n_embd,
+                            float * projected, int tts_n_embd);
+void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);

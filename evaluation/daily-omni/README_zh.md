@@ -7,7 +7,6 @@
 ```bash
 pip install pandas python-dotenv decord Pillow soundfile
 cd /path/to/llama.cpp-omni
-git apply /path/to/MiniCPM-V-CookBook/evaluation/daily-omni/llama-omni-eval-daily-cli.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-eval-daily-cli -j
 ```

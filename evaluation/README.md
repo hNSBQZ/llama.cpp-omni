@@ -22,45 +22,45 @@ cd evaluation
 
 ```bash
 ./run_all.sh --tasks videomme,rts
-./run_eval.sh tts --smoke 5          # 单任务（要求补丁已打好、target 已编译）
+./run_eval.sh tts --smoke 5          # 单任务（要求 target 已编译）
 ```
 
-## 为什么要打补丁
+## 依赖的 target
 
-三个精度测试各依赖一个不在主干里的常驻推理 CLI，由本目录下的 patch 引入：
-
-```
-videomme/llama-omni-eval-cli.patch          → tools/omni/omni-eval-cli.cpp
-daily-omni/llama-omni-eval-daily-cli.patch  → tools/omni/omni-eval-daily-cli.cpp
-tts_seed/llama-omni-tts-eval.patch          → tools/omni/omni-tts-eval.cpp
-                                              （还改 omni.cpp/omni.h/token2wav）
-```
-
-三个补丁都在 `tools/omni/CMakeLists.txt` 的同一处插 target，**不能同时打**。所以
-`run_all.sh` 对每个任务走一遍：
+四个任务各依赖一个 CMake target，全都在主干里，**不需要打补丁**：
 
 ```
-git apply <patch> → cmake --build --target <target> → 跑测试 → git apply -R <patch>
+videomme    llama-omni-eval-cli        tools/omni/omni-eval-cli.cpp
+daily-omni  llama-omni-eval-daily-cli  tools/omni/omni-eval-daily-cli.cpp
+tts         llama-omni-tts-eval        tools/omni/omni-tts-eval.cpp
+rts         llama-omni-server          tools/server/server-omni.cpp
 ```
 
-补丁新建的 `.cpp` 是 untracked，`git apply -R` 不会删，脚本会一并清掉。跑完
-`git status tools/` 应该是干净的。开跑前脚本也会检查 `tools/omni` 有没有残留改动，
-有的话直接退出，免得打补丁失败。
+三个精度评测 CLI 互不依赖，可以一次编完。`run_all.sh` 开跑前就是这么做的：把本次
+要跑的任务对应的 target 一起交给 cmake，编一次，然后依次跑测试。
 
-手动做同一件事：
+手动编：
 
 ```bash
 cd ..                                        # 到仓库根
-git apply evaluation/videomme/llama-omni-eval-cli.patch
 cmake -B build -DGGML_CANN=ON -DSOC_TYPE=Ascend910 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-omni-eval-cli -j
+cmake --build build -j \
+      --target llama-omni-eval-cli llama-omni-eval-daily-cli llama-omni-tts-eval
 cd evaluation && ./run_eval.sh videomme --smoke 2
-cd .. && git apply -R evaluation/videomme/llama-omni-eval-cli.patch
-rm -f tools/omni/omni-eval-cli.cpp
 ```
 
 上面用的是 Ascend 的 cmake 开关，NVIDIA 换成 `-DGGML_CUDA=ON`。构建目录名要和
 `config.env` 的 `EVAL_BIN_DIR` 对上（默认 `build/bin`）。
+
+三个 CLI 都是常驻进程：模型只加载一次，Python 侧把成百上千条样本喂进同一个进程，
+每张卡起一个。videomme / daily-omni 走 stdin/stdout 上的 JSONL 协议，tts 走 TSV
+manifest。协议细节见各 `.cpp` 顶部的注释。
+
+TTS 评测额外用到 `omni.cpp` 里的 `eval_tokens_with_hidden`、`tts_emb_text`、
+`tts_projector_semantic`、`normalize_l2_per_token`,这几个函数在 `omni.h` 里有声明。
+它跑的是 teacher-forced 合成（condition 用给定目标文本的 hidden states，而不是模型
+自己生成的文本），这是 seed-tts-eval 的口径要求，所以不能复用框架的流式 TTS 路径。
+用的公式跟主干 `tts-condition-graph.cpp` 那个 fused graph 一致。
 
 ## 配置
 
@@ -74,7 +74,7 @@ rm -f tools/omni/omni-eval-cli.cpp
 | smoke 数量 | `SMOKE_VIDEOMME` `SMOKE_DAILY_OMNI` `SMOKE_TTS`（0=全量） `RTS_MAX_DURATION` |
 | 数据集 | `ASSETS_DIR` 及各数据集路径、`RTS_VIDEO` |
 | TTS 打分模型 | `PARAFORMER_MODEL` `SPEAKER_CKPT` `S3PRL_REPO` `ONNX_MODEL_DIR` |
-| Python / 推理参数 | `EVAL_PYTHON` `RTS_PYTHON` `CTX_SIZE` `GGML_CANN_ACL_GRAPH` |
+| Python / 推理参数 | `EVAL_PYTHON` `RTS_PYTHON` `CTX_SIZE` `GGML_CANN_ACL_GRAPH` `EVAL_SEED` |
 
 优先级：命令行参数 > 环境变量 > `config.env`。常用覆盖：
 
@@ -103,6 +103,26 @@ appendix/
 ```
 
 下载地址见各子目录的 README。模型权重（`MODEL_DIR`）不放这里，单独配。
+
+### 采样种子
+
+`EVAL_SEED`（默认 42）是四个任务唯一的种子旋钮，`run_eval.py` 把它翻译成各流水线
+认的变量名：`SAMPLER_SEED`（videomme / daily-omni）、`SEED`（tts）、
+`OMNI_SAMPLER_SEED`（rts）。
+
+必须固定的原因是 `common_params` 的默认值 `LLAMA_DEFAULT_SEED` 会让采样器每次从
+`std::random_device` 重新播种，同一份构建重复跑分数就不一样，改动带来的真实变化和
+采样噪声分不开。三个精度 CLI 都接受 `--seed`，RTS 走 server 的 `--seed` 与
+`omni_init` 请求里的 `seed` 字段（两处取同一个值）。
+
+验证过的确定性：同一 seed 连跑两遍 daily-omni，逐题预测完全一致；连跑两遍 tts，
+生成的 wav 字节级相同（md5 一致，TTS 要走两千步自回归采样，这个比选择题敏感得多）。
+
+想知道分数的噪声底线就换几个 seed 各跑一遍：
+
+```bash
+for s in 42 1337 20260807; do EVAL_SEED=$s ./run_all.sh --tasks videomme; done
+```
 
 ### 卡的分配
 

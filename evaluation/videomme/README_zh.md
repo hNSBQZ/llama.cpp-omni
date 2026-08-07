@@ -7,7 +7,6 @@
 ```bash
 pip install pandas pyarrow python-dotenv decord Pillow
 cd /path/to/llama.cpp-omni
-git apply /path/to/MiniCPM-V-CookBook/evaluation/videomme/llama-omni-eval-cli.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-eval-cli -j
 ```

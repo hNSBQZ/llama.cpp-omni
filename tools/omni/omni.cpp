@@ -1170,7 +1170,7 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
     print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
 }
 
-static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
+bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb) {
     int N = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, N);
 
@@ -1209,7 +1209,7 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
 
 // 与 eval_tokens 类似，但会将每次 decode 的 hidden_state 保存并拼接到 hidden_states 中
 // hidden_states 由函数内部分配空间，大小为 N * n_embd * sizeof(float)，调用者负责释放
-static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, float *& hidden_states) {
+bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, float *& hidden_states) {
     int N = (int) tokens.size();
     if (N == 0) {
         hidden_states = nullptr;
@@ -2136,7 +2136,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
 // 1. 在omni_context中添加emb_text_weight字段（float*, 152064 * 768）
 // 2. 在omni_init中从TTS模型文件加载emb_text权重
 // 3. 在这里实现查找逻辑
-static bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
+bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
     // Check if weights are loaded
     if (!ctx_omni->emb_text_weight) {
         LOG_ERR("TTS: emb_text_weight not loaded\n");
@@ -2181,7 +2181,7 @@ static bool tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, f
 //     hidden_proj = ReLU(linear1(hidden) + bias1)  // (1, 4096) @ (4096, 768) = (1, 768)
 //     hidden_proj = linear2(hidden_proj) + bias2    // (1, 768) @ (768, 768) = (1, 768)
 //   归一化在调用者中完成（使用normalize_l2_per_token）
-static bool tts_projector_semantic(struct omni_context * ctx_omni, 
+bool tts_projector_semantic(struct omni_context * ctx_omni,
                                     const float * llm_hidden_states, int n_tokens, int llm_n_embd,
                                     float * projected_hidden_states, int tts_n_embd) {
     // 优先使用新的 ggml 实现 (精度验证版本)
@@ -2274,7 +2274,7 @@ static bool tts_projector_semantic(struct omni_context * ctx_omni,
 // 辅助函数：L2归一化（对每个token的embedding分别归一化）
 // 匹配Python的 F.normalize(hidden_embeds, p=2, dim=-1)
 // 注意：PyTorch的F.normalize使用sqrt(sum(x^2) + eps)，然后除以norm
-static void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f) {
+void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps) {
     for (int t = 0; t < n_tokens; t++) {
         float * vec = embeddings + t * n_embd;
         
@@ -2991,7 +2991,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     return id;
 }
 
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk = false) {
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk) {
     // Debug: Save logits directory (set via environment variable)
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
