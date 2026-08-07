@@ -155,7 +155,7 @@ def _probe_video_ffprobe(video_path: str) -> Tuple[float, int]:
 def _load_frames_ffmpeg(
     video_path: str, max_num_frames: int, max_fps: float,
 ) -> Tuple[List[Image.Image], List[int], float, int]:
-    """用 ffmpeg 命令行抽帧（fallback #1，本机没有 aarch64 decord 轮子时走这条）。
+    """用 ffmpeg 命令行抽帧（fallback #1，装不上 decord 时走这条，例如 aarch64）。
 
     先算出 decord 路径会取的那批帧下标，再把下标换成时间戳，逐个用 input seek
     (`-ss` 在 `-i` 之前) 抓单帧。不能简单地 `-vf fps=1 -vframes 64`：那样只覆盖

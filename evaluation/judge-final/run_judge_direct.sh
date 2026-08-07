@@ -43,7 +43,12 @@ if [[ -z "${LLAMACPP_ROOT:-}" ]]; then
   done
   LLAMACPP_ROOT="$probe"
 fi
-MODEL="${MODEL:-$HOME/o45-gguf/MiniCPM-o-4_5-F16.gguf}"
+# LLM 权重没有合理的默认值，用 MODEL= 或 --model 给
+MODEL="${MODEL:-}"
+MODEL_ARG=()
+if [[ -n "$MODEL" ]]; then
+  MODEL_ARG=(--model "$MODEL")
+fi
 # 多个视频用空格分隔
 VIDEO="${VIDEO:-$ROOT/assets/video/omni_duplex1.mp4}"
 read -r -a VIDEO_ARR <<< "$VIDEO"
@@ -63,12 +68,12 @@ if [[ -n "${NPU:-}" ]]; then
 fi
 
 echo "[judge] server bin : $(ls "$LLAMACPP_ROOT"/build*/bin/llama-omni-server 2>/dev/null | head -1)"
-echo "[judge] model      : $MODEL"
+echo "[judge] model      : ${MODEL:-由 --model 指定}"
 echo "[judge] video      : $VIDEO"
 echo "[judge] t2m/voc    : $OMNI_T2M_DEVICE / $OMNI_VOC_DEVICE"
 
 exec "$PY" "$ROOT/run_judge_direct.py" \
-  --model "$MODEL" \
+  "${MODEL_ARG[@]}" \
   --video "${VIDEO_ARR[@]}" \
   --llamacpp-root "$LLAMACPP_ROOT" \
   "${GPU_ARG[@]}" \

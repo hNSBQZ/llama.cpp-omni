@@ -52,12 +52,15 @@ git apply <patch> → cmake --build --target <target> → 跑测试 → git appl
 ```bash
 cd ..                                        # 到仓库根
 git apply evaluation/videomme/llama-omni-eval-cli.patch
-cmake -B build-kunpeng -DGGML_CANN=ON -DSOC_TYPE=Ascend910 -DCMAKE_BUILD_TYPE=Release
-cmake --build build-kunpeng --target llama-omni-eval-cli -j 64
+cmake -B build -DGGML_CANN=ON -DSOC_TYPE=Ascend910 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-omni-eval-cli -j
 cd evaluation && ./run_eval.sh videomme --smoke 2
 cd .. && git apply -R evaluation/videomme/llama-omni-eval-cli.patch
 rm -f tools/omni/omni-eval-cli.cpp
 ```
+
+上面用的是 Ascend 的 cmake 开关，NVIDIA 换成 `-DGGML_CUDA=ON`。构建目录名要和
+`config.env` 的 `EVAL_BIN_DIR` 对上（默认 `build/bin`）。
 
 ## 配置
 
@@ -76,16 +79,36 @@ rm -f tools/omni/omni-eval-cli.cpp
 优先级：命令行参数 > 环境变量 > `config.env`。常用覆盖：
 
 ```bash
-./run_all.sh --model ~/o45-gguf/MiniCPM-o-4_5-Q4_K_M.gguf
+./run_all.sh --model /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf
 ./run_all.sh --devices 4,5,6,7          # 用后四张卡
 ./run_all.sh --device-count 2           # 只用 DEVICE_IDS 的前两张
 ```
+
+### 数据与权重
+
+数据集和打分模型都不入库，统一挂在 `ASSETS_DIR`（默认 `evaluation/appendix/`，已被
+`.gitignore` 忽略）。自己下载后软链进去即可，也可以直接改 `config.env` 里对应的路径：
+
+```
+appendix/
+├── videomme/test-00000-of-00001.parquet   Video-MME 题目
+├── videomme/data/                         Video-MME 视频
+├── daily-omni/daily_omni.jsonl            Daily-Omni 标注（同目录放音视频）
+├── seedtts_testset_zh/zh/meta.lst         Seed-TTS 中文测试集
+├── paraformer-zh/                         WER 用 ASR 模型
+├── Step-Audio-2-mini/token2wav/           prompt bundle 提取用的 ONNX
+├── s3prl/                                 git clone 的 s3prl，SIM 的 WavLM backbone
+├── wavlm_large.pt                         WavLM-large 预训练权重
+└── wavlm_large_finetune.pth               SIM 的 ECAPA 微调 ckpt（缺了就跳过 SIM）
+```
+
+下载地址见各子目录的 README。模型权重（`MODEL_DIR`）不放这里，单独配。
 
 ### 卡的分配
 
 精度测试是每卡一个常驻 CLI 进程、卡间并行分数据：`DEVICE_IDS` 给出可用物理卡，
 第 n 个 worker 拿列表里第 n 张。`DEVICE_ENV_VAR` 决定用哪个变量名传给子进程，
-本机 Ascend 是 `ASCEND_RT_VISIBLE_DEVICES`，NVIDIA 机器改成 `CUDA_VISIBLE_DEVICES`。
+Ascend 上是 `ASCEND_RT_VISIBLE_DEVICES`，NVIDIA 机器改成 `CUDA_VISIBLE_DEVICES`。
 
 RTS 是单卡串行测延迟，`RTS_DEVICE_ID` 留空则按空闲显存自动挑（Ascend 每颗芯片
 空闲时有约 3GB 驱动基线占用，判定阈值见 `judge-final/judge_support.py`）。
@@ -123,9 +146,14 @@ output/<时间戳>/
 ./run_eval.sh --summarize --run-dir output/20260806_111206
 ```
 
-## 本机上的几个坑
+## 注意事项
 
-**必须关 `GGML_CANN_ACL_GRAPH`。** ggml-cann 默认开 ACL graph capture，而
+**Python 依赖分两套。** 精度测试的解释器（`EVAL_PYTHON`）要带 `pandas pyarrow torch
+torchaudio funasr jiwer librosa soundfile onnxruntime s3tokenizer zhconv scipy
+transformers`；RTS 只用到 `httpx requests websockets numpy soundfile`，走
+`RTS_PYTHON`，默认系统 `python3`。
+
+**Ascend 上必须关 `GGML_CANN_ACL_GRAPH`。** ggml-cann 默认开 ACL graph capture，而
 capture 期间不允许同步 `aclrtMemcpy`，`vision_image_batch_encode` 偏偏要逐帧往
 device 拷数据，于是 abort：
 
@@ -134,37 +162,27 @@ CANN error EE9999: rtMemcpy execution failed,
 reason=the current capture mode does not support this operation (107030)
 ```
 
-`config.env` 里已置 `off`。顺带一提，关掉后精度测试反而快很多（单题约 5 分钟 →
-14 秒），因为 capture 每轮都 miss 重建。
+四个任务都走 vision encode，`config.env` 里已统一置 `off`。关掉之后精度测试反而快
+很多（单题约 5 分钟 → 14 秒），因为 capture 每轮都 miss 重建。
 
-**没有 decord。** PyPI 不发 aarch64 轮子，视频抽帧退回 ffmpeg。原本的 ffmpeg 实现
-是 `-vf fps=1 -vframes 64`，只覆盖视频前 64 秒，而 Video-MME 的 medium/long 是十几
-分钟到一小时的长视频。已改成先算出 decord 路径会取的帧下标、换成时间戳，再逐个用
-input seek 抓单帧，见 `videomme/eval_cpp_video_prep.py`。
+**没有 decord 时用 ffmpeg 抽帧。** PyPI 不发 aarch64 轮子，这种平台上视频抽帧退回
+ffmpeg。直接用 `-vf fps=1 -vframes 64` 只能覆盖视频前 64 秒，而 Video-MME 的
+medium/long 是十几分钟到一小时的长视频，所以实现改成先算出 decord 路径会取的帧下标、
+换成时间戳，再逐个用 input seek 抓单帧，见 `videomme/eval_cpp_video_prep.py`。
 
-**`judge-final/.venv` 用不了**，那是 x86_64 的（`_cffi_backend...x86_64-linux-gnu.so`）。
-RTS 走 `RTS_PYTHON`（默认系统 `python3`），需要 `httpx requests websockets numpy soundfile`。
+**SIM 打分的 WavLM 权重要预先摆进 s3prl 缓存。** s3prl 的 `wavlm_large` 入口只认
+`https://huggingface.co/s3prl/converted_ckpts/resolve/main/wavlm_large.pt`，下载目录
+硬编码成 `$HOME/.cache/s3prl/download`（`s3prl/util/download.py` 的 `_download_dir`，
+没有环境变量可改），且只在文件不存在时才联网。`run_eval.py` 的 `ensure_s3prl_cache()`
+会在跑 tts 前把 `WAVLM_LARGE_PT` 按 URL 的 sha256 命名软链进那个缓存目录。
 
-**精度测试的解释器**要带 `pandas pyarrow torch torchaudio funasr jiwer librosa
-soundfile onnxruntime s3tokenizer zhconv scipy transformers`，配在 `EVAL_PYTHON`。
-
-**SIM 打分的 WavLM 权重必须预先摆进 s3prl 缓存。** s3prl 的 `wavlm_large` 入口只
-认 `https://huggingface.co/s3prl/converted_ckpts/resolve/main/wavlm_large.pt`，
-下载目录硬编码成 `$HOME/.cache/s3prl/download`（`s3prl/util/download.py` 的
-`_download_dir`，没有环境变量可改），且只在文件不存在时才联网。本机不通外网，不摆
-好的后果很隐蔽：每一对都先等一次连接超时（实测 130→280s 递增），异常又被
+离线机器上不摆好的后果很隐蔽：每一对都先等一次连接超时，异常又被
 `verification_pair_list_v2.py` 的 `except: print; continue` 吞掉，`model` 永远是
-`None`，于是 16 对全在重试，跑几十分钟一个分数都落不下来。
-
-`run_eval.py` 的 `ensure_s3prl_cache()` 会在跑 tts 前把 `WAVLM_LARGE_PT` 按 URL 的
-sha256 命名软链进那个缓存目录。要是它打印「没找到本地 wavlm_large.pt」，先去修
-`config.env` 里的路径，别急着开跑。
-
-那个 `except` 会连着 print 一起把异常吞进 stdout，而 stdout 重定向到文件时是块缓冲
-的，进程不结束就看不到。排查这类问题要么等它退出、要么用 `python3 -u` 单跑一对。
+`None`，跑几十分钟一个分数都落不下来。要是脚本打印「没找到本地 wavlm_large.pt」，先
+去修 `config.env` 里的路径再开跑。
 
 **SIM 是单进程的。** WER 那步按 `GPUS_PER_NODE` 切成多线程并行，SIM 一个进程跑到底，
-只能 CPU（Ascend 上没有 torch 后端）。另外 `NUM_SAMPLES` 的语义是「**每个 rank** 前
+且只能 CPU（Ascend 上没有 torch 后端）。另外 `NUM_SAMPLES` 的语义是「**每个 rank** 前
 N 条」，8 卡 + `--smoke 2` 实际是 16 条，smoke 想真只跑 2 条要配 `--device-count 1`。
 
 进度看 `tts_seed/logs/sim_*.log`（脚本把它重定向走了，终端上看不到；终端里那个
@@ -173,18 +191,3 @@ N 条」，8 卡 + `--smoke 2` 实际是 16 条，smoke 想真只跑 2 条要配
 **smoke 模式下官方评分被跳过。** `videomme/eval_your_result.py` 硬断言 short/medium/
 long 各 300 个视频，子集必然 assert 失败，所以 `--limit > 0` 时自动加 `--skip-scoring`，
 只报 pipeline 自己算的准确率。要官方分就跑 `--full`。
-
-## 已知待确认
-
-评测 prompt 已验证生效（同一张图换 prompt，输出跟着变），但有两点没定：
-
-- `videomme/eval_cpp_config.py` 的 `USER_PROMPT_TEMPLATE` 拼出来是
-  `...correct answer.Highlight the applicable choices...`，句号后没有分隔符；
-  且与 Video-MME 官方给的 `Select the best answer to the following
-  multiple-choice question based on the video...` 不是一套。目前按现状保留。
-- `omni_init` 无条件把非双工 omni 的 system prompt 设成音色克隆模板（含
-  `<|audio_start|>`），`use_tts=false` 也不例外；eval CLI 又传相对路径的 ref_audio
-  导致加载失败。结果评测时 system prompt 是「模仿音频样本的音色…`<|audio_start|>`
-  `<|audio_end|>`你的任务是用这种声音模式来当一个助手…」，带一个空音频槽和语音助手
-  人格。`omni.cpp` 里本来有 `has_ref_audio_slot == false → plain system message`
-  的分支，纯文本评测本该走那条。尚未改动。

@@ -4,25 +4,21 @@
 
 ## 环境
 
-本目录自带 Python 虚拟环境（`.venv/`）。`./run_judge_direct.sh` 会默认使用其中的解释器，无需单独安装 Python 依赖。`requirements.txt` 仅在需要重建虚拟环境时使用。
+Python 依赖见 `requirements.txt`：
+
+```bash
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+```
+
+`./run_judge_direct.sh` 优先用本目录下的 `.venv/`，没有就退回系统 `python3`。
 
 本目录自带示例输入：`assets/video/omni_duplex1.mp4`（双工评测用短视频）。
 
 ### 依赖获取
 
-另需自行准备 **llama.cpp-omni** 与 **MiniCPM-o-4_5-gguf**（可放在本目录同级或任意路径，通过 `--llamacpp-root` / `--model` 指定）。
+评测跑的是本仓库的 `llama-omni-server`，按 [docs/build.md](../../docs/build.md) 编译出来即可，用 `--llamacpp-root` 指向仓库根（默认是本目录上溯两级）。
 
-**llama.cpp-omni**（`bench/pref-e2e` 分支）：
-
-- 仓库：<https://github.com/tc-mb/llama.cpp-omni/tree/bench/pref-e2e>
-
-```bash
-git clone https://github.com/tc-mb/llama.cpp-omni.git
-cd llama.cpp-omni && git checkout bench/pref-e2e
-# 编译 llama-omni-server 后再评测，详见该仓库说明
-```
-
-**MiniCPM-o-4_5-gguf**（含 LLM / vision / audio / TTS 等子目录）：
+另需 **MiniCPM-o-4_5-gguf**（含 LLM / vision / audio / TTS 等子目录），放在任意路径，通过 `--model` 指定：
 
 - Hugging Face：<https://huggingface.co/openbmb/MiniCPM-o-4_5-gguf>
 - ModelScope：<https://modelscope.cn/models/OpenBMB/MiniCPM-o-4_5-gguf>
@@ -33,8 +29,7 @@ cd llama.cpp-omni && git checkout bench/pref-e2e
 
 ```bash
 ./run_judge_direct.sh --gpu 0 \
-  --model ../models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
-  --llamacpp-root ../llama.cpp-omni \
+  --model /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
   --video assets/video/omni_duplex1.mp4 \
   --min-free-mib 22000
 ```
@@ -43,10 +38,9 @@ cd llama.cpp-omni && git checkout bench/pref-e2e
 
 ```bash
 ./run_judge_direct.sh --gpu 0 \
-  --model ../models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
-  --llamacpp-root ../llama.cpp-omni \
+  --model /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
   --video assets/video/omni_duplex1.mp4 \
-         assets/video/omni_duplex1.mp4
+         assets/video/another.mp4
 ```
 
 常用参数：
@@ -55,7 +49,7 @@ cd llama.cpp-omni && git checkout bench/pref-e2e
 |------|------|
 | `--gpu` | GPU 编号；省略则自动选空闲卡 |
 | `--model` | LLM GGUF 路径（必填） |
-| `--llamacpp-root` | llama.cpp-omni 根目录（默认同级 `../llama.cpp-omni`） |
+| `--llamacpp-root` | 仓库根目录；省略则从本目录往上找带 `build*/bin/llama-omni-server` 的祖先 |
 | `--video` | 输入视频，可多个 |
 | `--max-chunks` | 最多处理多少个 chunk |
 | `--max-duration` | 最多处理多少秒（默认 120） |
@@ -72,7 +66,3 @@ cd llama.cpp-omni && git checkout bench/pref-e2e
 ```
 
 查看完整参数：`./run_judge_direct.sh --help`
-
----
-
-说明：本工具供自行评测与调优使用，非最终版本。

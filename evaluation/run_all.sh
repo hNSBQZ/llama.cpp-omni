@@ -66,7 +66,7 @@ else
 fi
 
 REPO="${LLAMACPP_ROOT:-$(cd "$SUITE_ROOT/.." && pwd)}"
-BUILD_DIR="$(basename "${EVAL_BIN_DIR%/bin}")"   # 如 build-kunpeng
+BUILD_DIR="$(basename "${EVAL_BIN_DIR%/bin}")"   # 由 config.env 的 EVAL_BIN_DIR 推出
 CMAKE_FLAGS=(-DGGML_CANN=ON -DSOC_TYPE=Ascend910 -DCMAKE_BUILD_TYPE=Release)
 JOBS="${BUILD_JOBS:-$(( $(nproc) < 64 ? $(nproc) : 64 ))}"
 

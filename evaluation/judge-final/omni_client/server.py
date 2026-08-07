@@ -28,7 +28,7 @@ def find_server_binary(llamacpp_root: str) -> str:
 
     OMNI_SERVER_BIN 可直接指定。否则按 llama-omni-server 优先于 llama-server 搜
     build* 目录 —— 本仓库把 omni server 单独建成 llama-omni-server，构建目录也
-    不一定叫 build（Ascend 上是 build-kunpeng）。
+    不一定叫 build（后端不同常另起一个）。
     """
     env_bin = os.environ.get("OMNI_SERVER_BIN")
     if env_bin:
@@ -39,11 +39,7 @@ def find_server_binary(llamacpp_root: str) -> str:
     if is_win:
         names = [n + ".exe" for n in names]
 
-    build_dirs = [
-        os.path.join(llamacpp_root, "build"),
-        os.path.join(llamacpp_root, "build-kunpeng"),
-        os.path.join(llamacpp_root, "build-x64-linux-cuda-release"),
-    ]
+    build_dirs = [os.path.join(llamacpp_root, "build")]
     build_dirs += sorted(glob.glob(os.path.join(llamacpp_root, "build*")))
 
     candidates: List[str] = []
