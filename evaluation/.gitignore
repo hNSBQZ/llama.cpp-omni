@@ -1,0 +1,16 @@
+# 指向本机资产的软链接，换机器要重建
+appendix/
+
+# 运行产物
+output/
+*/output/
+*/tmp_frames/
+*/tmp_media/
+*/log/
+*/logs/
+tts_seed/eval_results/
+tts_seed/run_cpp_eval_results.txt
+
+__pycache__/
+*.pyc
+.pydeps/

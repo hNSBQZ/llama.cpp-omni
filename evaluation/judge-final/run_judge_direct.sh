@@ -32,9 +32,21 @@ export OMNI_VOC_DEVICE="${OMNI_VOC_DEVICE:-gpu:0}"
 export OMNI_SAMPLER_SEED="${OMNI_SAMPLER_SEED:-42}"
 
 # ---- 默认参数 ----
-LLAMACPP_ROOT="${LLAMACPP_ROOT:-$(cd "$ROOT/.." && pwd)}"
+# 往上找第一个带 build*/bin/llama-omni-server 的祖先目录当仓库根
+if [[ -z "${LLAMACPP_ROOT:-}" ]]; then
+  probe="$ROOT"
+  for _ in 1 2 3; do
+    probe="$(cd "$probe/.." && pwd)"
+    if compgen -G "$probe/build*/bin/llama-omni-server" > /dev/null; then
+      break
+    fi
+  done
+  LLAMACPP_ROOT="$probe"
+fi
 MODEL="${MODEL:-$HOME/o45-gguf/MiniCPM-o-4_5-F16.gguf}"
+# 多个视频用空格分隔
 VIDEO="${VIDEO:-$ROOT/assets/video/omni_duplex1.mp4}"
+read -r -a VIDEO_ARR <<< "$VIDEO"
 
 PY="${JUDGE_PYTHON:-}"
 if [[ -z "$PY" ]]; then
@@ -57,7 +69,7 @@ echo "[judge] t2m/voc    : $OMNI_T2M_DEVICE / $OMNI_VOC_DEVICE"
 
 exec "$PY" "$ROOT/run_judge_direct.py" \
   --model "$MODEL" \
-  --video "$VIDEO" \
+  --video "${VIDEO_ARR[@]}" \
   --llamacpp-root "$LLAMACPP_ROOT" \
   "${GPU_ARG[@]}" \
   "$@"
