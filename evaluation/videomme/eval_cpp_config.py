@@ -55,10 +55,10 @@ MAX_FPS = 1.0
 MAX_SLICE_NUMS = 0
 MAX_TOKENS = 100          # 每题最多生成 token 数（CLI --n-predict）
 
-# 解码策略：TEMPERATURE > 0 是 sampling，改成 0 则退化为 greedy（对齐 Python
-# do_sample=False）。保持 sampling 的前提是 seed 必须固定，否则同一份构建每次跑
-# 出的准确率都不一样，没法用来判断改动的好坏。
-TEMPERATURE = 0.2
+# 解码策略：0 是 greedy，对齐 Python 参考实现的 do_sample=False。跑分必须用 greedy ——
+# 单选题在 temperature>0 下有相当比例的题会跑偏成长文本，答案里没有选项字母就直接算错，
+# 优化带来的真实差异会被这部分噪声盖掉。留 env 覆盖只为了对照实验。
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
 TOP_P = 0.8
 TOP_K = 100
 REPEAT_PENALTY = 1.02

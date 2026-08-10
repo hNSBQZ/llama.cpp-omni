@@ -72,8 +72,8 @@ echo "EVAL_SCRIPT_DIR: ${EVAL_SCRIPT_DIR}"
 echo "S3PRL_REPO:      ${S3PRL_REPO}"
 echo "PARAFORMER:      ${PARAFORMER_MODEL}"
 
-# 统一日志目录：所有 cpp / python 日志都放到 logs/ 下，文件名带时间戳
-LOG_BASE="${WORKDIR}/logs"
+# 日志跟评测产物放在一起，本次运行的目录被归档后仍可排查。
+LOG_BASE="${SAVE_DIR}/logs"
 mkdir -p "$LOG_BASE"
 
 # 构建 TTS_MODEL_PATH 相关的 generate_cpp.py 参数
@@ -239,7 +239,10 @@ if [ -f "$SPEAKER_CKPT" ]; then
     rm -f "$WAV_WAV_TEXT"
     rm -f "$SAVE_DIR/merge.out"
 
-    cat "$SAVE_DIR/wav_res_ref_text.sim.out" | grep -v "avg score" >> "$SAVE_DIR/merge.out"
+    if ! grep -v "avg score" "$SAVE_DIR/wav_res_ref_text.sim.out" > "$SAVE_DIR/merge.out"; then
+        echo "ERROR: Speaker Similarity 没有生成有效分数，详见 ${SIM_LOG}" >&2
+        exit 1
+    fi
     python3 "${SPEAKER_VERIF_DIR}/average.py" "$SAVE_DIR/merge.out" "$SCORE_FILE"
     echo "=== SIM Calculation Done ==="
 else

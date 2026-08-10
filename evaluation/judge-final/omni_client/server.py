@@ -175,6 +175,17 @@ class CppServerProcess:
 
         no_proxy = {"http": None, "https": None}
         for i in range(timeout_s):
+            proc = self._process
+            if proc is not None:
+                return_code = proc.poll()
+                if return_code is not None:
+                    log_path = self.log_path or os.path.join(
+                        self.output_dir, "cpp_server_stdout.log"
+                    )
+                    raise RuntimeError(
+                        f"C++ server exited before becoming ready "
+                        f"(code={return_code}, log={log_path})"
+                    )
             try:
                 r = requests.get(
                     f"{self.base_url}/health", timeout=2, proxies=no_proxy
