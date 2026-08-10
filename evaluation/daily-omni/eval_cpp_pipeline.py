@@ -27,7 +27,9 @@ from eval_cpp_config import (
     DATASET_DIR, ANNOTATION_PATH, OUTPUT_DIR, OUTPUT_JSON,
     NUM_GPUS, USER_PROMPT_TEMPLATE, MAX_NUM_FRAMES,
 )
-from eval_cpp_cli_client import OmniCliClient, start_all_clients, stop_all_clients
+from eval_cpp_cli_client import (
+    CliUnrecoverable, OmniCliClient, start_all_clients, stop_all_clients,
+)
 from eval_cpp_video_prep import prepare_video_frames, cleanup_sample_media, cleanup_all_media
 from eval_cpp_audio_prep import prepare_audio_segments
 
@@ -206,6 +208,11 @@ def process_sample(
         # 4. 提取答案
         result["prediction"] = extract_answer(raw_response)
 
+    except CliUnrecoverable:
+        # 这张卡救不回来了。继续问下去只会把余下题目都记成答错，最后表现成
+        # "分数偏低"而不是"评测失败" —— 那是要出申诉纠纷的。往上抛，停掉整个任务。
+        # 清理由下面的 finally 负责，这里只管往上传。
+        raise
     except Exception as e:
         logger.error(f"Error processing sample {sample_id}: {e}")
         result["raw_response"] = f"[ERROR] {e}"
@@ -236,7 +243,12 @@ def process_chunk(
         sid = sample.get("video_id", "?")
         logger.info(f"[GPU {gpu_id}] ({i+1}/{total}) Processing sample {sid}")
         t0 = time.time()
-        result = process_sample(client, sample, data_dir=data_dir)
+        try:
+            result = process_sample(client, sample, data_dir=data_dir)
+        except CliUnrecoverable:
+            # 让其它分片也停下来，别把机时耗在一次注定失败的运行上。
+            stop_event.set()
+            raise
         elapsed = time.time() - t0
         all_results.append(result)
 
@@ -315,6 +327,7 @@ def main():
     stop_event = threading.Event()
     interrupted = False
     clients = []
+    fatal_gpus = []
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -360,6 +373,10 @@ def main():
                     results = fut.result()
                     all_results.extend(results)
                     logger.info(f"GPU {gpu_id} completed: {len(results)} samples")
+                except CliUnrecoverable as e:
+                    logger.error(f"GPU {gpu_id} 不可恢复: {e}")
+                    fatal_gpus.append(gpu_id)
+                    stop_event.set()
                 except Exception as e:
                     logger.error(f"GPU {gpu_id} failed: {e}")
         except KeyboardInterrupt:
@@ -402,6 +419,13 @@ def main():
     if interrupted:
         logger.warning("Pipeline interrupted, skip rerun and scoring.")
         return
+
+    if fatal_gpus:
+        # 有分片彻底废了，剩下的题根本没跑过，这时候算分只会给出一个偏低但看着正常的
+        # 数字。宁可让任务失败，让上层知道这次结果不可用。
+        raise SystemExit(
+            f"GPU {fatal_gpus} 的 CLI 重启后仍不可用，本次结果不完整，不做重跑和评分。"
+            f"排查见各分片的 cli_gpu*.log")
 
     # 6. 重跑失败题目
     if not args.skip_rerun:
