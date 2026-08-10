@@ -149,6 +149,7 @@ def task_videomme(args, run_dir: Path) -> Dict[str, Any]:
         "DEVICE_ENV_VAR": cfg("DEVICE_ENV_VAR", "ASCEND_RT_VISIBLE_DEVICES"),
         cfg("DEVICE_ENV_VAR", "ASCEND_RT_VISIBLE_DEVICES"): ",".join(ids),
         "EXTRA_LD_LIBRARY_PATH": cfg("EVAL_BIN_DIR"),
+        "GGML_CANN_WEIGHT_NZ": cfg("GGML_CANN_WEIGHT_NZ", "off"),
         "GGML_CANN_ACL_GRAPH": cfg("GGML_CANN_ACL_GRAPH", "off"),
     })
 
@@ -192,6 +193,7 @@ def task_daily_omni(args, run_dir: Path) -> Dict[str, Any]:
         "DEVICE_ENV_VAR": cfg("DEVICE_ENV_VAR", "ASCEND_RT_VISIBLE_DEVICES"),
         cfg("DEVICE_ENV_VAR", "ASCEND_RT_VISIBLE_DEVICES"): ",".join(ids),
         "EXTRA_LD_LIBRARY_PATH": cfg("EVAL_BIN_DIR"),
+        "GGML_CANN_WEIGHT_NZ": cfg("GGML_CANN_WEIGHT_NZ", "off"),
         "GGML_CANN_ACL_GRAPH": cfg("GGML_CANN_ACL_GRAPH", "off"),
     })
 
@@ -285,6 +287,7 @@ def task_tts(args, run_dir: Path) -> Dict[str, Any]:
         "NUM_SAMPLES": str(limit if limit > 0 else 10_000_000),
         "DEVICE_ENV_VAR": cfg("DEVICE_ENV_VAR", "ASCEND_RT_VISIBLE_DEVICES"),
         "DEVICE_IDS": ",".join(ids),
+        "GGML_CANN_WEIGHT_NZ": cfg("GGML_CANN_WEIGHT_NZ", "off"),
         "GGML_CANN_ACL_GRAPH": cfg("GGML_CANN_ACL_GRAPH", "off"),
     })
 
@@ -337,6 +340,7 @@ def task_rts(args, run_dir: Path) -> Dict[str, Any]:
 
     env = base_env({
         "OMNI_SERVER_BIN": cfg("OMNI_SERVER_BIN"),
+        "GGML_CANN_WEIGHT_NZ": cfg("GGML_CANN_WEIGHT_NZ", "off"),
         "GGML_CANN_ACL_GRAPH": cfg("GGML_CANN_ACL_GRAPH", "off"),
         "OMNI_T2W_DEVICE": os.environ.get("OMNI_T2W_DEVICE", "gpu"),
         "OMNI_T2M_DEVICE": os.environ.get("OMNI_T2M_DEVICE", "gpu:0"),
