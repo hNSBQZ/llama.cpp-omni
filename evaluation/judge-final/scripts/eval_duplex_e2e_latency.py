@@ -118,6 +118,67 @@ def _parse_stage_timing(path: Optional[Path]) -> Dict[str, List[Dict[str, Any]]]
 
 _RTF_STAGES = ("encode", "llm_prefill", "llm_decode", "tts", "token2wav")
 
+# 掐头去尾后剩这么少帧就该提醒了：能进 core 的只有中间稳态帧，样本太少时
+# 单帧抖动会直接写进 pooled RTF。
+_RTF_CORE_MIN_FRAMES = 5
+
+
+def _mark_rtf_turns(frames: List[Dict[str, Any]]) -> int:
+    """按 turn_eos 的 flush 尾包切音频轮次，给每帧标 turn_idx 与 role。返回轮次数。
+
+    轮次边界不用 e2e 的 speak_turn_id：那个只在遇到 LISTEN/IDLE 帧时才断，模型说完
+    一轮紧接着又说下一轮时会被并成一个 turn（实测一个 speak_turn 里出现过 3 次
+    turn_eos）。C++ 的 is_final 才是 turn_eos 的直接标记 —— 那一包 audio_tokens 是空的，
+    只为让 T2W 把 buffer 吐干净。
+
+    role:
+      head  轮次首帧。TTS/T2W 缓存空，首个 wav 常不足一帧时长，与稳态不可比。
+      tail  含 flush 尾包的帧。尾音的 tts 耗时早算在前面的帧上，这里只有 t2w，
+            白送一段分母，RTF 系统性偏低。
+      core  中间稳态帧：一帧输入 1s 音频、产出 1s 音频，口径最干净。
+    """
+    turn_idx = 0
+    turn_head = True
+    for f in frames:
+        f["turn_idx"] = turn_idx
+        if f["has_final_wav"]:
+            f["role"] = "tail"
+            turn_idx += 1
+            turn_head = True
+        elif turn_head:
+            f["role"] = "head"
+            turn_head = False
+        else:
+            f["role"] = "core"
+    # 末段没有 flush 收尾（被 stop 截断）时不补 tail：那一帧本身就是稳态帧。
+    return turn_idx if turn_head else turn_idx + 1
+
+
+def _rtf_pool(frames: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """一组帧的 pooled RTF：Σ耗时 / Σ音频。"""
+    audio_total = sum(f["audio_ms"] for f in frames)
+    compute_total = sum(f["compute_ms"] for f in frames)
+    out: Dict[str, Any] = {
+        "n_frames": len(frames),
+        "audio_total_ms": round(audio_total, 1),
+        "compute_total_ms": round(compute_total, 1),
+        "rtf_aggregate": round(compute_total / audio_total, 4) if audio_total else None,
+        "rtf": _rtf_stats([f["rtf"] for f in frames]),
+        "stage_rtf": {
+            s: (
+                round(sum(f[f"{s}_ms"] for f in frames) / audio_total, 4)
+                if audio_total
+                else None
+            )
+            for s in _RTF_STAGES
+        },
+    }
+    if frames:
+        auds = [f["audio_ms"] for f in frames]
+        out["audio_ms_min"] = round(min(auds), 1)
+        out["audio_ms_max"] = round(max(auds), 1)
+    return out
+
 
 def _analyze_rtf(
     stage: Dict[str, List[Dict[str, Any]]],
@@ -131,6 +192,11 @@ def _analyze_rtf(
     帧号来自 C++ 的 src_cnt（在 prefill packet 上带下来的 cnt），所有属于同一帧的
     wav 会合并成一条记录 —— 绝大多数帧只产一个 wav，轮次结尾的 flush 尾包会和
     正常包并到同一帧，所以这里始终是"一帧一条 RTF"，不需要再区分包和帧。
+
+    主指标是 core（掐头去尾）：按 turn_eos 切音频轮次，去掉每轮的首帧和含 flush 尾包
+    的帧，只对中间稳态帧做 Σ耗时/Σ音频。这样分母被钉在"每帧 1s 音频"上，不同选手
+    量化后 turn 数、每 turn 的 wav 数怎么变，都不影响这个比值的口径。
+    全量 rtf_aggregate 仍然保留作对照。
 
     数据来源：
       - encode / llm_prefill / llm_decode  ← e2e_timing 的 chunk 事件（SSE metrics）
@@ -158,12 +224,24 @@ def _analyze_rtf(
         if cnt is None:
             continue
         agg = by_cnt.setdefault(
-            int(cnt), {"audio_ms": 0.0, "token2wav": 0.0, "tts": 0.0, "n_wav": 0, "wavs": []}
+            int(cnt),
+            {
+                "audio_ms": 0.0,
+                "token2wav": 0.0,
+                "tts": 0.0,
+                "n_wav": 0,
+                "wavs": [],
+                "has_final": False,
+                "flush_audio_ms": 0.0,
+            },
         )
         agg["audio_ms"] += float(e.get("duration_ms") or 0.0)
         agg["token2wav"] += float(e.get("token2wav_ms") or 0.0)
         agg["n_wav"] += 1
         agg["wavs"].append(e.get("wav"))
+        if e.get("is_final"):
+            agg["has_final"] = True
+            agg["flush_audio_ms"] += float(e.get("duration_ms") or 0.0)
     for e in stage["tts"]:
         cnt = e.get("src_cnt")
         if cnt is None or int(cnt) not in by_cnt:
@@ -207,6 +285,8 @@ def _analyze_rtf(
             "mode": c.get("mode", "?"),
             "n_wav": agg["n_wav"],
             "wavs": agg["wavs"],
+            "has_final_wav": bool(agg["has_final"]),
+            "flush_audio_ms": round(agg["flush_audio_ms"], 1),
             "audio_ms": round(audio_ms, 1),
             **{f"{k}_ms": round(v, 1) for k, v in stages.items()},
             "compute_ms": round(compute_ms, 1),
@@ -219,6 +299,42 @@ def _analyze_rtf(
             f"{n_missing_llm}/{len(frames)} 帧在 e2e_timing 里找不到对应 cnt 的 chunk，"
             "这些帧的 RTF 只含 tts+token2wav"
         )
+
+    n_turns = _mark_rtf_turns(frames)
+    core_frames = [f for f in frames if f["role"] == "core"]
+    core = _rtf_pool(core_frames)
+    core["available"] = bool(core_frames)
+    core["n_turns"] = n_turns
+    core["n_excluded_head"] = sum(1 for f in frames if f["role"] == "head")
+    core["n_excluded_tail"] = sum(1 for f in frames if f["role"] == "tail")
+    core["excluded_audio_ms"] = round(
+        sum(f["audio_ms"] for f in frames if f["role"] != "core"), 1
+    )
+
+    if not core_frames:
+        warnings.append(
+            f"掐头去尾后没有剩余帧（{n_turns} 个 turn 都不足 3 帧），"
+            "core RTF 不可用，只能看全量 rtf_aggregate"
+        )
+    else:
+        if len(core_frames) < _RTF_CORE_MIN_FRAMES:
+            warnings.append(
+                f"core 只剩 {len(core_frames)} 帧（{n_turns} 个 turn 大多不足 3 帧），"
+                "样本太少，core RTF 波动大"
+            )
+        # core 帧本该一帧一 wav、一帧 1s 音频。不齐说明 turn 切分或 wav 归帧有问题，
+        # 此时分母不再是恒定的，跨选手比较会失真，必须报出来。
+        n_core_multi = sum(1 for f in core_frames if f["n_wav"] > 1)
+        if n_core_multi:
+            warnings.append(
+                f"{n_core_multi}/{len(core_frames)} 个 core 帧产出多个 wav，"
+                "中间段的音频时长不再恒定"
+            )
+        if core["audio_ms_max"] - core["audio_ms_min"] > 1.0:
+            warnings.append(
+                f"core 帧音频时长不齐（{core['audio_ms_min']}~{core['audio_ms_max']}ms），"
+                "分母不恒定，跨选手对比需谨慎"
+            )
 
     audio_total = sum(f["audio_ms"] for f in frames)
     compute_total = sum(f["compute_ms"] for f in frames)
@@ -235,18 +351,25 @@ def _analyze_rtf(
         "n_frames": len(frames),
         "n_wav": len(t2w_events),
         "n_frames_multi_wav": n_multi,
+        "n_turns": n_turns,
         "audio_total_ms": round(audio_total, 1),
         "compute_total_ms": round(compute_total, 1),
         "rtf": _rtf_stats([f["rtf"] for f in frames]),
         "rtf_aggregate": round(compute_total / audio_total, 4) if audio_total else None,
         "stage_rtf": stage_rtf,
+        "core": core,
         "frames": frames,
         "warnings": warnings,
         "note": (
             "每帧 RTF = (encode + llm_prefill + llm_decode + tts + token2wav) / 该帧音频时长。"
             "encode 取 max(VPM, APM)（两者并行）。帧号来自 C++ 的 src_cnt，"
             "同一帧的多个 wav（轮次结尾的 flush 尾包）已合并。"
-            "rtf_aggregate = 总耗时/总音频，不受短包权重影响；"
+            "主指标 core.rtf_aggregate：按 turn_eos(is_final) 切音频轮次，剔掉每轮首帧"
+            "（TTS/T2W 冷启动、首个 wav 常不足一帧）和含 flush 尾包的帧（尾音的 tts 耗时"
+            "早算在前面的帧上，只剩 t2w，白送分母），剩下的中间稳态帧 Σ耗时/Σ音频。"
+            "含 flush 的帧整帧剔除而不是只剔那个小 wav：该帧的 tts/decode 是为两个 wav 的"
+            "token 一起花的，拆不开，只减音频会把 RTF 抬虚高。"
+            "rtf_aggregate/rtf/stage_rtf 是全量口径（含头尾），作对照；"
             "stage_rtf 是各阶段单独的 RTF，相加等于 rtf_aggregate。"
             "不含 judge 侧 http_prefill（临时文件 + HTTP 往返，非模型算力）。"
         ),
@@ -468,7 +591,7 @@ def _analyze_e2e(session_dir: Path) -> Dict[str, Any]:
             for p in pairs_empty
         ],
         "metric_primary": "e2e_speak_recv_to_wav_poll_ms.mean_ms",
-        "metric_rtf": "rtf.rtf.mean",
+        "metric_rtf": "rtf.core.rtf_aggregate",
         "note": (
             "主指标：SPEAK chunk 进入 worker 处理时刻(t_recv) → 对应 wav 被 poll 到(t_poll)；"
             "按 wav 的 src_cnt 归帧（拿不到才退回 last_speak_chunk_idx），一帧多包只取首包。"
@@ -476,7 +599,7 @@ def _analyze_e2e(session_dir: Path) -> Dict[str, Any]:
             "IDLE（轮次已结束、零产出）不计入 SPEAK。"
             "stage_ms：VPM/APM/llm_prefill/cost_llm 来自 e2e chunk；tts/t2w 来自 stage_timing.jsonl。"
             "口径：e2e≈wall+decode→wav；各 stage 为流水线算力，不可直接相加得到 e2e。"
-            "RTF 见 rtf 段落。"
+            "RTF 见 rtf 段落，主指标 rtf.core.rtf_aggregate（掐头去尾）。"
         ),
     }
     return report
@@ -514,6 +637,15 @@ _STAGE_LABEL = {
 }
 
 
+def _stage_breakdown(stage_rtf: Dict[str, Any]) -> str:
+    parts = [
+        f"{_STAGE_LABEL[s]} {stage_rtf[s]:.3f}"
+        for s in _RTF_STAGES
+        if stage_rtf.get(s) is not None
+    ]
+    return " + ".join(parts)
+
+
 def _print_rtf(rtf: Dict[str, Any]) -> None:
     """RTF 报告：算子加速比赛的核心指标，放在延迟前面打。"""
     if not rtf.get("available"):
@@ -522,12 +654,42 @@ def _print_rtf(rtf: Dict[str, Any]) -> None:
             _log(f"    ! {w}")
         return
 
+    core = rtf.get("core") or {}
+    if core.get("available"):
+        _log(
+            f"  ★ RTF（掐头去尾）  turn={core.get('n_turns')}  "
+            f"帧数={core['n_frames']}  音频={core['audio_total_ms'] / 1000:.2f}s  "
+            f"算力耗时={core['compute_total_ms'] / 1000:.2f}s"
+        )
+        if core.get("rtf_aggregate") is not None:
+            _log(f"    Σ耗时/Σ音频     {core['rtf_aggregate']:.3f}   ← 主指标")
+        cst = core.get("rtf") or {}
+        if cst.get("n"):
+            p95 = f", p95 {cst['p95']:.3f}" if cst.get("p95") is not None else ""
+            _log(
+                f"    每帧全链路      平均 {cst['mean']:.3f}  "
+                f"(中位 {cst['median']:.3f}{p95}, "
+                f"min {cst['min']:.3f}, max {cst['max']:.3f}, n={cst['n']})"
+            )
+        parts = _stage_breakdown(core.get("stage_rtf") or {})
+        if parts:
+            _log("    分解: " + parts)
+        _log(
+            f"    剔除: 每轮首帧 ×{core.get('n_excluded_head')} + "
+            f"含 flush 尾包的帧 ×{core.get('n_excluded_tail')}"
+            f"（共 {float(core.get('excluded_audio_ms') or 0) / 1000:.2f}s 音频）"
+        )
+
     st = rtf.get("rtf") or {}
+    label = "  (对照) 全量" if core.get("available") else "  ★ RTF  全量"
     _log(
-        f"  ★ RTF  帧数={rtf['n_frames']}  wav={rtf['n_wav']}  "
+        f"{label}  帧数={rtf['n_frames']}  wav={rtf['n_wav']}  "
         f"音频={rtf['audio_total_ms'] / 1000:.2f}s  "
         f"算力耗时={rtf['compute_total_ms'] / 1000:.2f}s"
     )
+    agg = rtf.get("rtf_aggregate")
+    if agg is not None:
+        _log(f"    Σ耗时/Σ音频     {agg:.3f}")
     if st.get("n"):
         p95 = f", p95 {st['p95']:.3f}" if st.get("p95") is not None else ""
         _log(
@@ -535,18 +697,10 @@ def _print_rtf(rtf: Dict[str, Any]) -> None:
             f"(中位 {st['median']:.3f}{p95}, "
             f"min {st['min']:.3f}, max {st['max']:.3f}, n={st['n']})"
         )
-    agg = rtf.get("rtf_aggregate")
-    if agg is not None:
-        _log(f"    总耗时/总音频   {agg:.3f}")
-
-    srtf = rtf.get("stage_rtf") or {}
-    parts = [
-        f"{_STAGE_LABEL[s]} {srtf[s]:.3f}"
-        for s in _RTF_STAGES
-        if srtf.get(s) is not None
-    ]
-    if parts:
-        _log("    分解: " + " + ".join(parts))
+    if not core.get("available"):
+        parts = _stage_breakdown(rtf.get("stage_rtf") or {})
+        if parts:
+            _log("    分解: " + parts)
 
     n_multi = rtf.get("n_frames_multi_wav") or 0
     n_idle = sum(1 for f in (rtf.get("frames") or []) if f.get("mode") == "IDLE")

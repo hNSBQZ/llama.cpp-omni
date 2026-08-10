@@ -258,19 +258,40 @@ def print_latency_summary(
 
     # RTF 是算子加速比赛的核心指标，放最前面
     if rtf.get("available"):
-        head = f"    ★ RTF  帧数={rtf.get('n_frames')}  wav={rtf.get('n_wav')}"
+        order = ("encode", "llm_prefill", "llm_decode", "tts", "token2wav")
+
+        def _breakdown(srtf: Any) -> Optional[str]:
+            if not isinstance(srtf, dict):
+                return None
+            parts = [f"{s} {srtf[s]:.3f}" for s in order if srtf.get(s) is not None]
+            return " + ".join(parts) if parts else None
+
+        core = rtf.get("core") or {}
+        if core.get("available"):
+            head = f"    ★ RTF（掐头去尾）  turn={core.get('n_turns')}  帧数={core.get('n_frames')}"
+            if core.get("audio_total_ms"):
+                head += f"  音频{float(core['audio_total_ms']) / 1000:.1f}s"
+            line(head)
+            if core.get("rtf_aggregate") is not None:
+                line(f"    Σ耗时/Σ音频         {core['rtf_aggregate']:.3f}\t← 主指标")
+            rtf_row("每帧全链路", core.get("rtf"))
+            parts = _breakdown(core.get("stage_rtf"))
+            if parts:
+                line("    分解: " + parts)
+
+        head = ("    (对照) 全量" if core.get("available") else "    ★ RTF  全量")
+        head += f"  帧数={rtf.get('n_frames')}  wav={rtf.get('n_wav')}"
         if rtf.get("audio_total_ms"):
             head += f"  音频{float(rtf['audio_total_ms']) / 1000:.1f}s"
         line(head)
-        rtf_row("每帧全链路", rtf.get("rtf"))
         agg = rtf.get("rtf_aggregate")
         if agg is not None:
-            line(f"    总耗时/总音频       {agg:.3f}")
-        srtf = rtf.get("stage_rtf") or {}
-        order = ("encode", "llm_prefill", "llm_decode", "tts", "token2wav")
-        parts = [f"{s} {srtf[s]:.3f}" for s in order if srtf.get(s) is not None]
-        if parts:
-            line("    分解: " + " + ".join(parts))
+            line(f"    Σ耗时/Σ音频         {agg:.3f}")
+        if not core.get("available"):
+            rtf_row("每帧全链路", rtf.get("rtf"))
+            parts = _breakdown(rtf.get("stage_rtf"))
+            if parts:
+                line("    分解: " + parts)
         for w in rtf.get("warnings") or []:
             line(f"    ! {w}")
         line("    " + "-" * 40)
@@ -383,40 +404,72 @@ def _average_rtf(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     分布类指标（mean/median/p95）按视频等权平均；
     aggregate 与 stage_rtf 用总耗时/总音频重新算，不受各视频音频长短影响。
+    core（掐头去尾）同样按帧汇总：只取 role=core 的中间稳态帧。
     """
     avail = [r for r in reports if isinstance(r.get("rtf"), dict) and r["rtf"].get("available")]
     if not avail:
         return {"available": False}
 
     stages = ("encode", "llm_prefill", "llm_decode", "tts", "token2wav")
-    audio_total = 0.0
-    compute_total = 0.0
-    stage_total = {s: 0.0 for s in stages}
-    n_wav = 0
-    n_frames = 0
-    for r in avail:
-        rtf = r["rtf"]
-        n_wav += int(rtf.get("n_wav") or 0)
-        n_frames += int(rtf.get("n_frames") or 0)
-        for f in rtf.get("frames") or []:
-            audio_total += float(f.get("audio_ms") or 0.0)
-            compute_total += float(f.get("compute_ms") or 0.0)
-            for s in stages:
-                stage_total[s] += float(f.get(f"{s}_ms") or 0.0)
 
+    def _pool(core_only: bool) -> Dict[str, Any]:
+        audio_total = 0.0
+        compute_total = 0.0
+        stage_total = {s: 0.0 for s in stages}
+        n_frames = 0
+        for r in avail:
+            for f in r["rtf"].get("frames") or []:
+                if core_only and f.get("role") != "core":
+                    continue
+                n_frames += 1
+                audio_total += float(f.get("audio_ms") or 0.0)
+                compute_total += float(f.get("compute_ms") or 0.0)
+                for s in stages:
+                    stage_total[s] += float(f.get(f"{s}_ms") or 0.0)
+        return {
+            "n_frames": n_frames,
+            "audio_total_ms": round(audio_total, 1),
+            "compute_total_ms": round(compute_total, 1),
+            "rtf_aggregate": (
+                round(compute_total / audio_total, 4) if audio_total else None
+            ),
+            "stage_rtf": {
+                s: (round(stage_total[s] / audio_total, 4) if audio_total else None)
+                for s in stages
+            },
+        }
+
+    core = _pool(core_only=True)
+    core["available"] = core["n_frames"] > 0
+    core["rtf"] = _avg_rtf_stat(reports, "rtf", "core", "rtf")
+    core["n_turns"] = sum(
+        int((r["rtf"].get("core") or {}).get("n_turns") or 0) for r in avail
+    )
+    core["n_videos"] = sum(
+        1 for r in avail if (r["rtf"].get("core") or {}).get("available")
+    )
+
+    warnings: List[str] = []
+    n_no_core = len(avail) - int(core["n_videos"])
+    if n_no_core:
+        warnings.append(
+            f"{n_no_core}/{len(avail)} 个视频掐头去尾后无中间帧（turn 太短），"
+            "未计入 core"
+        )
+
+    full = _pool(core_only=False)
     return {
         "available": True,
         "n_videos": len(avail),
-        "n_frames": n_frames,
-        "n_wav": n_wav,
-        "audio_total_ms": round(audio_total, 1),
-        "compute_total_ms": round(compute_total, 1),
+        "n_frames": full["n_frames"],
+        "n_wav": sum(int(r["rtf"].get("n_wav") or 0) for r in avail),
+        "audio_total_ms": full["audio_total_ms"],
+        "compute_total_ms": full["compute_total_ms"],
         "rtf": _avg_rtf_stat(reports, "rtf", "rtf"),
-        "rtf_aggregate": round(compute_total / audio_total, 4) if audio_total else None,
-        "stage_rtf": {
-            s: (round(stage_total[s] / audio_total, 4) if audio_total else None)
-            for s in stages
-        },
+        "rtf_aggregate": full["rtf_aggregate"],
+        "stage_rtf": full["stage_rtf"],
+        "core": core,
+        "warnings": warnings,
         "avg_mode": "per-video unweighted mean; aggregate pooled by total audio",
     }
 

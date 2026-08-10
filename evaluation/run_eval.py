@@ -384,21 +384,33 @@ def _collect_rts_metrics(judge_root: Path, runs_dir: Path, stdout: str) -> Dict[
 
     if report:
         rtf = report.get("rtf") or {}
-        inner = rtf.get("rtf") or {}
-        stage = rtf.get("stage_rtf") or {}
-        metrics["RTF_每帧均值"] = inner.get("mean")
-        metrics["RTF_总耗时比总音频"] = rtf.get("rtf_aggregate")
+        # 主指标用掐头去尾的 core：剔掉每轮首帧（冷启动）和含 flush 尾包的帧（尾音白送
+        # 分母）后，分母恒为"每帧 1s 音频"，量化改变 turn 数/wav 数也不影响口径。
+        core = rtf.get("core") or {}
+        main = core if core.get("available") else rtf
+        stage = main.get("stage_rtf") or {}
+        metrics["RTF_掐头去尾"] = main.get("rtf_aggregate")
+        metrics["RTF_每帧均值"] = (main.get("rtf") or {}).get("mean")
+        metrics["RTF_帧数"] = main.get("n_frames")
+        metrics["RTF_turn数"] = main.get("n_turns")
         if stage:
             metrics["RTF_分解"] = " + ".join(
                 f"{k} {v}" for k, v in stage.items())
         e2e = report.get("e2e_speak_recv_to_wav_poll_ms") or {}
         metrics["SPEAK→wav_均值ms"] = e2e.get("mean_ms")
         metrics["SPEAK→wav_中位ms"] = e2e.get("median_ms")
-        metrics["音频总时长ms"] = rtf.get("audio_total_ms")
-        metrics["算力总耗时ms"] = rtf.get("compute_total_ms")
+        metrics["音频总时长ms"] = main.get("audio_total_ms")
+        metrics["算力总耗时ms"] = main.get("compute_total_ms")
+        metrics["RTF_全量对照"] = rtf.get("rtf_aggregate")
+        if not core.get("available"):
+            metrics["RTF_口径"] = "core 不可用，已回退全量（含头尾）"
+        warns = rtf.get("warnings") or []
+        if warns:
+            metrics["RTF_告警"] = "；".join(str(w) for w in warns)
     else:
-        metrics["RTF_每帧均值"] = _grep_last(stdout, r"每帧全链路\s+([\d.]+)")
-        metrics["RTF_总耗时比总音频"] = _grep_last(stdout, r"总耗时/总音频\s+([\d.]+)")
+        metrics["RTF_掐头去尾"] = _grep_last(
+            stdout, r"RTF（掐头去尾）[\s\S]*?Σ耗时/Σ音频\s+([\d.]+)")
+        metrics["RTF_每帧均值"] = _grep_last(stdout, r"每帧全链路\s+(?:平均\s+)?([\d.]+)")
         metrics["SPEAK→wav_均值ms"] = _grep_last(stdout, r"SPEAK→wav e2e\s+([\d.]+) ms")
 
     return metrics
@@ -427,7 +439,7 @@ HEADLINE = {
     "videomme": ["准确率", "官方Overall"],
     "daily-omni": ["准确率", "官方Overall"],
     "tts": ["WER", "SIM(ASV)"],
-    "rts": ["RTF_总耗时比总音频", "SPEAK→wav_均值ms"],
+    "rts": ["RTF_掐头去尾", "SPEAK→wav_均值ms"],
 }
 
 
