@@ -139,7 +139,10 @@ static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
 static FILE * g_proto = nullptr;
 
 static void proto_write(const json & obj) {
-    const std::string s = obj.dump();
+    // n_predict 会把生成截断在多字节字符中间，留下不合法的 UTF-8 片段。默认的 strict
+    // 处理会抛 type_error.316，这里没人接，整个进程 abort，本分片剩下的题全部记错。
+    // 用 replace 把坏字节换成 U+FFFD：答案抽取只看选项字母，替换不影响判分。
+    const std::string s = obj.dump(-1, ' ', false, json::error_handler_t::replace);
     if (g_proto) {
         fwrite(s.data(), 1, s.size(), g_proto);
         fputc('\n', g_proto);
@@ -291,7 +294,7 @@ static void show_usage(const char * prog) {
         "  --max-slice-nums <n>   Default vision slices per frame (default: 0 = use global)\n"
         "  --n-predict <n>        Max generated tokens per answer (default: 128)\n"
         "  --seed <n>             Sampling seed (default: 42; fixed so runs are reproducible)\n"
-        "  --temp <f>             Sampling temperature (default: 0.7)\n"
+        "  --temp <f>             Sampling temperature (default: 0 = greedy)\n"
         "  --top-p <f>            top-p (default: 0.8)\n"
         "  --top-k <n>            top-k (default: 100)\n"
         "  --repeat-penalty <f>   repetition penalty (default: 1.02)\n"
@@ -316,7 +319,9 @@ int main(int argc, char ** argv) {
     // time and a real accuracy change is indistinguishable from sampling noise.
     // Matters more here than for Video-MME since this task samples at temp=0.7.
     uint32_t seed        = 42;
-    float temp           = 0.7f;
+    // Greedy by default: this is a multiple-choice benchmark, matching the Python
+    // reference implementation's do_sample=False.
+    float temp           = 0.0f;
     float top_p          = 0.8f;
     int   top_k          = 100;
     float repeat_penalty = 1.02f;
