@@ -36,10 +36,18 @@ from eval_cpp_config import (
     LLAMA_CLI_BIN, LLM_MODEL_PATH, CTX_SIZE,
     MAX_SLICE_NUMS, MAX_TOKENS,
     TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY, SAMPLER_SEED,
-    CLI_STARTUP_TIMEOUT, INFER_TIMEOUT,
+    CLI_STARTUP_TIMEOUT, INFER_TIMEOUT, MAX_CLI_RESTARTS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CliUnhealthy(RuntimeError):
+    """CLI 卡死或已退出。重启能恢复，单题的模型错误不属于这一类。"""
+
+
+class CliUnrecoverable(RuntimeError):
+    """重启次数用尽仍不可用。整个任务应当失败退出，而不是把余下题目都记成答错。"""
 
 
 def _rotate_logs(log_dir: str, gpu_id: int, keep: int = 5) -> str:
@@ -114,12 +122,26 @@ class OmniCliClient:
 
         if log_dir is None:
             log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
-        self.log_path = _rotate_logs(log_dir, gpu_id, keep=keep_rotated_logs)
-        self._log_f = open(self.log_path, "w", encoding="utf-8", buffering=1)
 
-        logger.info(f"[GPU {gpu_id}] launching daily CLI: {' '.join(cmd)}  (log: {self.log_path})")
+        # 重启要用同一套命令和环境，所以存下来。
+        self._cmd = cmd
+        self._env = env
+        self._log_dir = log_dir
+        self._keep_rotated_logs = keep_rotated_logs
+        self.restarts = 0
+        self._spawn()
+
+    # ---------------- 进程生命周期 ----------------
+
+    def _spawn(self) -> None:
+        """起一个新的 CLI 子进程。日志会轮转，上一条命的日志留着排查。"""
+        self.log_path = _rotate_logs(self._log_dir, self.gpu_id,
+                                     keep=self._keep_rotated_logs)
+        self._log_f = open(self.log_path, "w", encoding="utf-8", buffering=1)
+        logger.info(f"[GPU {self.gpu_id}] launching daily CLI: {' '.join(self._cmd)}"
+                    f"  (log: {self.log_path})")
         self.proc = subprocess.Popen(
-            cmd, env=env,
+            self._cmd, env=self._env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,   # 干净的协议通道
             stderr=self._log_f,       # 模型/ggml 噪声
@@ -127,11 +149,47 @@ class OmniCliClient:
             preexec_fn=os.setsid,
         )
 
+    def _kill(self) -> None:
+        """强杀整个进程组。卡在设备调用里的进程不会响应协议层的 quit。"""
+        if self.proc.poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), sig)
+                    self.proc.wait(timeout=10)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+                except Exception:
+                    break
+        for stream in (self.proc.stdin, self.proc.stdout):
+            try:
+                if stream and not stream.closed:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            if self._log_f and not self._log_f.closed:
+                self._log_f.close()
+        except Exception:
+            pass
+
+    def restart(self) -> bool:
+        """杀掉重启并等待就绪。超过重启上限直接拒绝。"""
+        if self.restarts >= MAX_CLI_RESTARTS:
+            return False
+        self.restarts += 1
+        logger.warning(f"[GPU {self.gpu_id}] 重启 CLI"
+                       f"（第 {self.restarts}/{MAX_CLI_RESTARTS} 次）")
+        self._kill()
+        self._spawn()
+        return self.wait_ready()
+
     # ---------------- 底层协议 ----------------
 
     def _send(self, obj: dict) -> None:
         if self.proc.poll() is not None:
-            raise RuntimeError(f"[GPU {self.gpu_id}] CLI process已退出 (code={self.proc.returncode})")
+            raise CliUnhealthy(
+                f"[GPU {self.gpu_id}] CLI process已退出 (code={self.proc.returncode})")
         self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
 
@@ -191,11 +249,43 @@ class OmniCliClient:
         n_predict: Optional[int] = None,
         timeout: float = INFER_TIMEOUT,
     ) -> str:
-        """
-        单题推理：reset -> 交错 prefill(帧, 音频) -> prefill 文本 -> decode。返回模型原始文本。
+        """单题推理，卡死或进程已退出时重启一次再重试。
 
-        对应原 HTTP 客户端的 reset + prefill_interleaved + prefill_text + decode 一条链。
+        必须重启而不是重发请求：卡死的形态是 CLI 的线程阻塞在一个同步的设备调用里，
+        它既不读 stdin 也不返回，协议层面发什么都没人接。不重启的话，该分片剩下的
+        每道题都会空等满 INFER_TIMEOUT。
+
+        每题在 CLI 侧都会 reset（清 KV、重建 system prompt），所以重启只损失当前这题，
+        重试它即可，前面的结果不受影响。
         """
+        try:
+            return self._infer_once(frame_paths, audio_paths, prompt, qid,
+                                    max_slice_nums, n_predict, timeout)
+        except CliUnhealthy as e:
+            logger.warning(f"[GPU {self.gpu_id}] {e}，尝试重启后重试 qid={qid}")
+            if not self.restart():
+                raise CliUnrecoverable(
+                    f"[GPU {self.gpu_id}] 重启失败或已用尽 {MAX_CLI_RESTARTS} 次机会"
+                    f"（最后一次失败于 qid={qid}）") from e
+            try:
+                return self._infer_once(frame_paths, audio_paths, prompt, qid,
+                                        max_slice_nums, n_predict, timeout)
+            except CliUnhealthy as e2:
+                # 重启后立刻又卡死/退出，说明不是偶发，别再耗下去。
+                raise CliUnrecoverable(
+                    f"[GPU {self.gpu_id}] 重启后仍然不可用（qid={qid}）") from e2
+
+    def _infer_once(
+        self,
+        frame_paths: List[str],
+        audio_paths: List[str],
+        prompt: str,
+        qid: str,
+        max_slice_nums: Optional[int],
+        n_predict: Optional[int],
+        timeout: float,
+    ) -> str:
+        """一次尝试：reset -> 交错 prefill(帧, 音频) -> prefill 文本 -> decode。"""
         req = {
             "type": "infer",
             "id": qid,
@@ -208,10 +298,12 @@ class OmniCliClient:
         self._send(req)
         obj = self._read_json(timeout=timeout)
         if obj is None:
-            raise RuntimeError(f"[GPU {self.gpu_id}] infer 超时或进程退出 (qid={qid})")
+            # 读不到东西：超时（卡死）或管道 EOF（进程没了），两者都要重启。
+            raise CliUnhealthy(f"[GPU {self.gpu_id}] infer 超时或进程退出 (qid={qid})")
         if obj.get("type") != "result":
             raise RuntimeError(f"[GPU {self.gpu_id}] 非预期响应: {obj}")
         if not obj.get("ok", False):
+            # CLI 还活着，只是这道题算失败了 —— 属于单题错误，不重启。
             raise RuntimeError(f"[GPU {self.gpu_id}] infer 失败 (qid={qid}): {obj.get('error')}")
         return obj.get("response", "")
 

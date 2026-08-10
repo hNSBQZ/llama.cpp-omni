@@ -81,3 +81,10 @@ USER_PROMPT_TEMPLATE = (
 
 CLI_STARTUP_TIMEOUT = 300      # 等待 CLI 加载模型（秒）
 INFER_TIMEOUT = 300            # 单题推理超时（秒），多帧 prefill + decode 可能较慢
+
+# 单题超时或 CLI 进程已退出时，杀掉重启再重试一次；每张卡最多重启这么多次。
+# 不重启的话，一次算子卡死会让该分片剩下的每道题都空等满 INFER_TIMEOUT ——
+# 实测过一次：一张卡卡死后剩余 89 个视频要耗 22 小时，全部记零分。
+# 超过上限说明不是偶发，整个任务直接失败退出，而不是继续把余下题目记成答错：
+# 崩掉的分片如果只体现为"分数偏低"，就分不清是选手代码差还是评测挂了。
+MAX_CLI_RESTARTS = int(os.environ.get("MAX_CLI_RESTARTS", "3"))
