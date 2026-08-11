@@ -1,0 +1,35 @@
+# Core data and media
+numpy
+pandas
+pyarrow
+Pillow
+soundfile
+librosa
+scipy
+tqdm
+python-dotenv
+pyrubberband
+
+# TTS evaluation
+funasr
+jiwer
+onnxruntime
+s3tokenizer
+transformers
+zhconv
+zhon
+
+# RTS / duplex evaluation
+httpx
+requests
+websockets
+
+# Optional plots
+matplotlib
+
+# Install torch, torchaudio and torchvision separately with versions matching
+# the host architecture and runtime. On Ascend, use the platform-provided
+# compatible wheels instead of letting pip choose an arbitrary build.
+#
+# decord is optional. If it is unavailable (common on aarch64), the video
+# loaders automatically fall back to the system ffmpeg executable.
