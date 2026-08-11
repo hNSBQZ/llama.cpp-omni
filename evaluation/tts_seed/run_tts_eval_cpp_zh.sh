@@ -7,17 +7,13 @@ set -e
 
 # 集中配置：所有外部路径/设备都在 pipeline.env（可用环境变量覆盖）
 source "$(cd "$(dirname "$0")"; pwd)/pipeline.env"
+# WER / SIM 两段与 run_eval_only.sh 共用一份实现，dev_of 也在里面
+source "$(cd "$(dirname "$0")"; pwd)/metrics_stages.sh"
 
 echo "Python: $(command -v python3)"
 
 # llama-omni-tts-eval 运行时需要其构建目录下的 libomni.so 等；CUDA 版还需 CUDA 运行库
 export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB}:${CPP_BUILD_LIB}:${LD_LIBRARY_PATH}"
-
-# 设备变量名随后端变（CUDA_VISIBLE_DEVICES / ASCEND_RT_VISIBLE_DEVICES），
-# DEVICE_IDS 是可用物理卡列表；第 n 个并行 rank 用列表里第 n 张卡。
-DEVICE_ENV_VAR=${DEVICE_ENV_VAR:-CUDA_VISIBLE_DEVICES}
-IFS=',' read -r -a DEVICE_ID_ARR <<< "${DEVICE_IDS:-0}"
-dev_of() { echo "${DEVICE_ID_ARR[$1]:-$1}"; }
 
 # 1. 参数设置
 TIME_STR=$(date +%Y%m%d_%H%M%S)
@@ -179,38 +175,7 @@ echo "=== TTS Inference Done ==="
 echo "=== Step 3: WER Calculation ==="
 WER_LOG="${LOG_BASE}/wer_${TIME_STR}.log"
 echo "  Log: ${WER_LOG}"
-META_LST="$EVAL_META_PATH"
-LANGUAGE="$LANG"
-
-WAV_WAV_TEXT=$SAVE_DIR/wav_res_ref_text
-SCORE_FILE=$SAVE_DIR/wav_res_ref_text.wer
-
-python3 "${EVAL_SCRIPT_DIR}/get_wav_res_ref_text.py" "$META_LST" "$SAVE_DIR" "$WAV_WAV_TEXT"
-
-timestamp=$(date +%s)
-thread_dir=$SAVE_DIR/thread_metas_wer_$timestamp/
-mkdir -p "$thread_dir"
-num_job=${GPUS_PER_NODE}
-num=$(wc -l < "$WAV_WAV_TEXT")
-num_per_thread=$(expr $num / $num_job + 1)
-split -l $num_per_thread --additional-suffix=.lst -d "$WAV_WAV_TEXT" "$thread_dir/thread-"
-out_dir=$thread_dir/results/
-mkdir -p "$out_dir"
-
-for rank in $(seq 0 $((num_job - 1))); do
-    sub_score_file=$out_dir/thread-0$rank.wer.out
-    env "${DEVICE_ENV_VAR}=$(dev_of "$rank")" python3 "${EVAL_SCRIPT_DIR}/run_wer.py" \
-        "$thread_dir/thread-0$rank.lst" "$sub_score_file" "$LANGUAGE" \
-        >> "${WER_LOG}" 2>&1 &
-done
-wait
-
-rm -f "$WAV_WAV_TEXT"
-rm -f "$SAVE_DIR/merge.out"
-
-cat "$out_dir"/thread-0*.wer.out >> "$out_dir/merge.out"
-python3 "${EVAL_SCRIPT_DIR}/average_wer.py" "$out_dir/merge.out" "$SCORE_FILE"
-
+wer_stage "$SAVE_DIR" "$EVAL_META_PATH" "$LANG" "$WER_LOG"
 echo "=== WER Calculation Done ==="
 
 # ============================================================
@@ -219,35 +184,7 @@ echo "=== WER Calculation Done ==="
 echo "=== Step 4: Speaker Similarity ==="
 SIM_LOG="${LOG_BASE}/sim_${TIME_STR}.log"
 echo "  Log: ${SIM_LOG}"
-if [ -f "$SPEAKER_CKPT" ]; then
-    WAV_WAV_TEXT=$SAVE_DIR/wav_res_ref_text
-    SCORE_FILE=$SAVE_DIR/wav_res_ref_text.sim
-
-    python3 "${EVAL_SCRIPT_DIR}/get_wav_res_ref_text.py" "$META_LST" "$SAVE_DIR" "$WAV_WAV_TEXT"
-
-    python3 "${SPEAKER_VERIF_DIR}/verification_pair_list_v2.py" "$WAV_WAV_TEXT" \
-        --model_name wavlm_large \
-        --checkpoint "$SPEAKER_CKPT" \
-        --scores "$SAVE_DIR/wav_res_ref_text.sim.out" \
-        --wav1_start_sr 0 \
-        --wav2_start_sr 0 \
-        --wav1_end_sr -1 \
-        --wav2_end_sr -1 \
-        --device "${SIM_DEVICE:-cuda:0}" \
-        >> "${SIM_LOG}" 2>&1
-
-    rm -f "$WAV_WAV_TEXT"
-    rm -f "$SAVE_DIR/merge.out"
-
-    if ! grep -v "avg score" "$SAVE_DIR/wav_res_ref_text.sim.out" > "$SAVE_DIR/merge.out"; then
-        echo "ERROR: Speaker Similarity 没有生成有效分数，详见 ${SIM_LOG}" >&2
-        exit 1
-    fi
-    python3 "${SPEAKER_VERIF_DIR}/average.py" "$SAVE_DIR/merge.out" "$SCORE_FILE"
-    echo "=== SIM Calculation Done ==="
-else
-    echo "WARNING: Speaker checkpoint not found at ${SPEAKER_CKPT}, skipping SIM."
-fi
+sim_stage "$SAVE_DIR" "$EVAL_META_PATH" "$SIM_LOG"
 
 # ============================================================
 # 6. 汇总结果
