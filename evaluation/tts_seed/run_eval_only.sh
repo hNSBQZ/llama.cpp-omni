@@ -1,13 +1,8 @@
 #!/bin/bash
+# 仅跑 WER + SIM（跳过推理）。用法: bash run_eval_only.sh /path/to/save_dir
 set -e
 
-# ============================================================
-# 仅运行 WER + SIM 评测（跳过推理，直接用已生成的 wav）
-# 用法: bash run_eval_only.sh /path/to/save_dir
-# ============================================================
-
 source "$(cd "$(dirname "$0")"; pwd)/pipeline.env"
-# WER / SIM 两段与 run_tts_eval_cpp_zh.sh 共用一份实现
 source "$(cd "$(dirname "$0")"; pwd)/metrics_stages.sh"
 
 echo "Python: $(command -v python3)"
@@ -51,26 +46,17 @@ echo "============================================"
 wav_count=$(ls "$SAVE_DIR"/*.wav 2>/dev/null | wc -l)
 echo "Found ${wav_count} wav files in SAVE_DIR"
 
-# ============================================================
-# 1. 计算 WER
-# ============================================================
 echo "=== Step 1: WER Calculation ==="
 WER_LOG="${LOG_BASE}/wer_evalonly_${TIME_STR}.log"
 echo "  Log: ${WER_LOG}"
 wer_stage "$SAVE_DIR" "$EVAL_META_PATH" "$LANG" "$WER_LOG"
 echo "=== WER Calculation Done ==="
 
-# ============================================================
-# 2. 计算音频相似度 (Speaker Similarity)
-# ============================================================
 echo "=== Step 2: Speaker Similarity ==="
 SIM_LOG="${LOG_BASE}/sim_evalonly_${TIME_STR}.log"
 echo "  Log: ${SIM_LOG}"
 sim_stage "$SAVE_DIR" "$EVAL_META_PATH" "$SIM_LOG"
 
-# ============================================================
-# 3. 汇总结果
-# ============================================================
 RESULT_FILE="${WORKDIR}/run_cpp_eval_results.txt"
 echo "==============================" >> "$RESULT_FILE"
 echo "EVAL DONE: $(date)" >> "$RESULT_FILE"
@@ -84,7 +70,7 @@ echo " EVAL_DATA_PATH: ${EVAL_DATA_PATH}" >> "$RESULT_FILE"
 echo " SEED:           ${SEED}" >> "$RESULT_FILE"
 echo "==============================" >> "$RESULT_FILE"
 
-echo "=== All Evaluation Done ==="
-echo "Results saved to: ${SAVE_DIR}"
-echo "Logs saved to:    ${LOG_BASE}/*_${TIME_STR}.log"
-echo "Summary appended to: ${RESULT_FILE}"
+echo "=== Eval-only Done ==="
+echo "Results in: ${SAVE_DIR}"
+echo "Logs in:    ${LOG_BASE}/*_evalonly_${TIME_STR}.log"
+echo "Summary:    ${RESULT_FILE}"

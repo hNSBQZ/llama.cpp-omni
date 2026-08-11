@@ -1,29 +1,17 @@
 #!/usr/bin/env bash
-# MiniCPM-o 评测套件 —— 一条命令跑完四个任务。
+# 一次编译并串行跑完指定任务。用法见 ./run_all.sh --help；细节见 README.md
 #
-# 四个任务各依赖一个 CMake target，都在主干里，不需要打补丁：
-#
-#     videomme   → llama-omni-eval-cli
-#     daily-omni → llama-omni-eval-daily-cli
-#     tts        → llama-omni-tts-eval
-#     rts        → llama-omni-server
-#
-# 本脚本先把要用到的 target 一次编出来，再依次跑测试。四个任务的产物收进同一个
-# output/<时间戳>/，最后统一打印数值汇总。
-#
-# 用法:
-#   ./run_all.sh                       # 按 config.env 的 SMOKE_* 跑
-#   ./run_all.sh --smoke 5             # 三个精度测试各只跑 5 条
-#   ./run_all.sh --full                # 精度测试跑全量
-#   ./run_all.sh --tasks videomme,rts  # 只跑指定任务
-#   ./run_all.sh --devices 0,1,2,3     # 指定用哪几张卡
-#   ./run_all.sh --no-build            # 已编译过，跳过编译
+#   ./run_all.sh
+#   ./run_all.sh --smoke 5
+#   ./run_all.sh --full
+#   ./run_all.sh --tasks videomme,rts
+#   ./run_all.sh --devices 0,1,2,3
+#   ./run_all.sh --no-build
 set -uo pipefail
 
 SUITE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EVAL_SUITE_ROOT="$SUITE_ROOT"
 
-# ---------------------------------------------------------------- 参数
 TASKS="videomme,daily-omni,tts,rts"
 DO_BUILD=1
 PASS_ARGS=()
@@ -34,16 +22,23 @@ while [[ $# -gt 0 ]]; do
     --tasks=*)     TASKS="${1#*=}"; shift ;;
     --no-build)    DO_BUILD=0; shift ;;
     -h|--help)
-      sed -n '/^# MiniCPM-o/,/^# *--no-build/p' "${BASH_SOURCE[0]}" \
-        | sed 's/^#\{1,\} \{0,1\}//'
-      echo
-      echo "其余参数原样透传给 run_eval.sh，见 ./run_eval.sh --help"
+      cat <<'EOF'
+一次编译并串行跑完指定任务。细节见 README.md
+
+  ./run_all.sh
+  ./run_all.sh --smoke 5
+  ./run_all.sh --full
+  ./run_all.sh --tasks videomme,rts
+  ./run_all.sh --devices 0,1,2,3
+  ./run_all.sh --no-build
+
+其余参数透传给 run_eval.sh，见 ./run_eval.sh --help
+EOF
       exit 0 ;;
     *)             PASS_ARGS+=("$1"); shift ;;
   esac
 done
 
-# ---------------------------------------------------------------- 配置
 CONFIG="${EVAL_CONFIG:-$SUITE_ROOT/config.env}"
 if [[ ! -f "$CONFIG" ]]; then
   echo "找不到配置文件: $CONFIG" >&2
@@ -51,8 +46,6 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 set -a; source "$CONFIG"; set +a
 
-# CANN 环境：cmake 要靠它找 CANN_INSTALL_DIR，不 source 直接 configure 就报
-# "Can't find CANN_INSTALL_DIR"。run_eval.sh 里也会 source 一次，重复无害。
 ASCEND_ENV="${ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 if [[ -f "$ASCEND_ENV" ]]; then
   set +u
@@ -64,7 +57,7 @@ else
 fi
 
 REPO="${LLAMACPP_ROOT:-$(cd "$SUITE_ROOT/.." && pwd)}"
-BUILD_DIR="$(basename "${EVAL_BIN_DIR%/bin}")"   # 由 config.env 的 EVAL_BIN_DIR 推出
+BUILD_DIR="$(basename "${EVAL_BIN_DIR%/bin}")"
 CMAKE_FLAGS=(-DGGML_CANN=ON -DSOC_TYPE=Ascend910 -DCMAKE_BUILD_TYPE=Release)
 JOBS="${BUILD_JOBS:-$(( $(nproc) < 64 ? $(nproc) : 64 ))}"
 
@@ -73,7 +66,6 @@ RUN_DIR="$SUITE_ROOT/output/$STAMP"
 mkdir -p "$RUN_DIR"
 BUILD_LOG="$RUN_DIR/build.log"
 
-# task -> cmake target
 declare -A TASK_TARGET=(
   [videomme]="llama-omni-eval-cli"
   [daily-omni]="llama-omni-eval-daily-cli"
@@ -84,7 +76,6 @@ declare -A TASK_TARGET=(
 log()  { printf '\n\033[1;36m[run_all]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[run_all]\033[0m %s\n' "$*" >&2; }
 
-# ---------------------------------------------------------------- 开场
 cat <<EOF
 
 $(printf '=%.0s' {1..78})
@@ -98,7 +89,6 @@ $(printf '=%.0s' {1..78})
 $(printf '=%.0s' {1..78})
 EOF
 
-# ---------------------------------------------------------------- 任务清单
 declare -a DONE_TASKS=()
 declare -a FAILED_TASKS=()
 declare -a RUN_TASKS=()
@@ -119,8 +109,6 @@ if [[ ${#RUN_TASKS[@]} -eq 0 ]]; then
   exit 2
 fi
 
-# ---------------------------------------------------------------- 编译
-# 四个 target 互不冲突，一次 configure 全部编出来，不必每个任务重来一遍。
 if [[ $DO_BUILD -eq 1 ]]; then
   declare -a BUILD_TARGETS=()
   for task in "${RUN_TASKS[@]}"; do
@@ -140,7 +128,6 @@ if [[ $DO_BUILD -eq 1 ]]; then
   log "编译完成"
 fi
 
-# ---------------------------------------------------------------- 主循环
 for task in "${RUN_TASKS[@]}"; do
   log "===== $task ====="
   "$SUITE_ROOT/run_eval.sh" "$task" --run-dir "$RUN_DIR" --keep-going "${PASS_ARGS[@]}"
@@ -152,7 +139,6 @@ for task in "${RUN_TASKS[@]}"; do
   fi
 done
 
-# ---------------------------------------------------------------- 汇总
 log "全部任务结束，汇总数值"
 "${RUNNER_PYTHON:-python3}" "$SUITE_ROOT/run_eval.py" --summarize --run-dir "$RUN_DIR"
 

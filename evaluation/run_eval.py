@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""MiniCPM-o 评测套件统一调度器。
-
-四个任务共用 config.env 里的一份配置，这里负责把配置翻译成各子流水线认的
-环境变量/命令行参数，串行跑，最后把关键指标汇总打印出来。
-
-不要直接跑这个脚本 —— 用 run_eval.sh，它会先 source config.env 和 Ascend
-的 set_env.sh。
-"""
+"""评测调度：把 config.env 映射到各子流水线并汇总指标。请用 run_eval.sh 启动。"""
 
 from __future__ import annotations
 
@@ -95,10 +88,7 @@ def run_step(
 
 def base_env(extra: Dict[str, str]) -> Dict[str, str]:
     env = os.environ.copy()
-    # 采样种子：EVAL_SEED 是唯一旋钮，这里翻译成四条流水线各自认的变量名。
-    #   SAMPLER_SEED       videomme / daily-omni 的 eval_cpp_config.py
-    #   SEED               tts 的 run_tts_eval_cpp_zh.sh → generate_cpp.py --seed
-    #   OMNI_SAMPLER_SEED  rts 的 judge-final（--seed 与 omni_init 的 seed 字段）
+    # EVAL_SEED → 各流水线认的变量名
     seed = cfg("EVAL_SEED", "42")
     env.setdefault("SAMPLER_SEED", seed)
     env.setdefault("SEED", seed)
@@ -108,8 +98,7 @@ def base_env(extra: Dict[str, str]) -> Dict[str, str]:
 
 
 def _grep_last(text: str, pattern: str) -> Optional[str]:
-    """取最后一个匹配。开 MULTILINE，`^` 才是行首而不是整段文本的开头 ——
-    汇总行都在 .wer / .sim 文件末尾，靠它定位。"""
+    """取最后一个匹配（汇总行通常在文件末尾）。"""
     m = re.findall(pattern, text, re.MULTILINE)
     return m[-1] if m else None
 
@@ -134,7 +123,7 @@ def task_videomme(args, run_dir: Path) -> Dict[str, Any]:
            "--output", str(out_json)]
     if args.skip_rerun:
         cmd.append("--skip-rerun")
-    # 官方评分脚本断言 short/medium/long 各 300 个视频，只有全量成立
+    # 子集无法过官方评分断言，仅全量保留 scoring
     if limit > 0:
         cmd.append("--skip-scoring")
 
@@ -157,7 +146,6 @@ def task_videomme(args, run_dir: Path) -> Dict[str, Any]:
     res["metrics"] = {
         "n_samples": "全量 2700 题" if limit == 0 else f"前 {limit} 题",
         "准确率": _grep_last(res["stdout"], r"Accuracy: (\d+/\d+ = [\d.]+%)"),
-        # 官方评分脚本最后一行 "Overall:  XX.X%" 是整个数据集的总分
         "官方Overall": _grep_last(res["stdout"], r"^Overall:\s*([\d.]+%)"),
         "output_json": str(out_json),
     }
@@ -201,26 +189,18 @@ def task_daily_omni(args, run_dir: Path) -> Dict[str, Any]:
     res["metrics"] = {
         "n_samples": "全量 1197 题" if limit == 0 else f"前 {limit} 题",
         "准确率": _grep_last(res["stdout"], r"Accuracy: (\d+/\d+ = [\d.]+%)"),
-        # 评分脚本 "--- Overall ---" 段里的 "Total: XX.X% (n/m)"
         "官方Overall": _grep_last(res["stdout"], r"Total:\s*([\d.]+%\s*\(\d+/\d+\))"),
         "output_json": str(out_json),
     }
     return res
 
 
-# s3prl 的 wavlm_large 入口写死了这个 URL，缓存文件名是它的 sha256
+# s3prl wavlm_large 缓存按该 URL 的 sha256 命名
 S3PRL_WAVLM_URL = "https://huggingface.co/s3prl/converted_ckpts/resolve/main/wavlm_large.pt"
 
 
 def ensure_s3prl_cache() -> Optional[str]:
-    """把本地 wavlm_large.pt 摆到 s3prl 认的缓存位置，供 SIM 打分用。
-
-    s3prl 的 wavlm_large 只认 URL，下载目录硬编码成 $HOME/.cache/s3prl/download
-    （见 s3prl/util/download.py 的 _download_dir），且只在文件不存在时才联网。
-    这台机器不通外网，不预先摆好的话每一对都要先等一次 huggingface 连接超时
-    （实测 130~280s），异常又被 verification_pair_list_v2.py 的 except 吞掉，
-    结果 SIM 一个分数都落不下来，还白等几十分钟。
-    """
+    """把本地 wavlm_large.pt 链到 s3prl 缓存目录，供离线 SIM 打分。"""
     src = cfg("WAVLM_LARGE_PT")
     if not src or not Path(src).exists():
         return None
@@ -236,7 +216,7 @@ def ensure_s3prl_cache() -> Optional[str]:
     try:
         dst.symlink_to(Path(src).resolve())
     except OSError as e:
-        print(f"[tts] 摆放 s3prl 缓存失败，SIM 大概会去联网然后超时: {e}", flush=True)
+        print(f"[tts] 摆放 s3prl 缓存失败: {e}", flush=True)
         return None
     return str(dst)
 
@@ -259,7 +239,7 @@ def task_tts(args, run_dir: Path) -> Dict[str, Any]:
         print("[tts] 没找到本地 wavlm_large.pt（配 WAVLM_LARGE_PT），"
               "SIM 会尝试联网下载", flush=True)
 
-    # run_tts_eval_cpp_zh.sh 内部到处调 python3，把带重依赖的解释器塞到 PATH 前面
+    # 子脚本内部调用 python3，把 EVAL_PYTHON 所在目录放到 PATH 前
     py = Path(cfg("EVAL_PYTHON", "python3"))
     path = os.environ.get("PATH", "")
     if py.is_file():
@@ -298,13 +278,11 @@ def task_tts(args, run_dir: Path) -> Dict[str, Any]:
         "n_samples": "全量 2020 条" if limit == 0 else f"每卡前 {limit} 条",
         "生成wav数": len(list(save_dir.glob("*.wav"))) if save_dir.is_dir() else 0,
     }
-    # WER：逐条 ASR 结果与 meta.lst 参考文本比，汇总行在 .wer 文件末尾
     wer_file = save_dir / "wav_res_ref_text.wer"
     if wer_file.is_file():
         txt = wer_file.read_text(encoding="utf-8", errors="replace")
         metrics["WER"] = _grep_last(txt, r"^WER:\s*([\d.]+%?)")
         metrics["WER_NORMALIZED"] = _grep_last(txt, r"^WER_NORMALIZED:\s*([\d.]+%?)")
-    # SIM：生成音频与参考 prompt 音频的说话人 embedding 余弦相似度均值
     sim_file = save_dir / "wav_res_ref_text.sim"
     if sim_file.is_file():
         txt = sim_file.read_text(encoding="utf-8", errors="replace")
@@ -370,7 +348,6 @@ def _collect_rts_metrics(judge_root: Path, runs_dir: Path, stdout: str) -> Dict[
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             meta = {}
-        # run_meta 里的路径是相对 judge-final 的
         for key in ("batch_avg_report", "session_dir"):
             rel = meta.get(key)
             if not rel:
@@ -388,8 +365,7 @@ def _collect_rts_metrics(judge_root: Path, runs_dir: Path, stdout: str) -> Dict[
 
     if report:
         rtf = report.get("rtf") or {}
-        # 主指标用 core 稳态窗口；完整帧数、全量对照和告警保留在原始 report 中，
-        # 最终汇总只展示用户最关心的均值、阶段分解与端到端延迟。
+        # 优先用 core 稳态窗口；完整对照仍在原始 report
         core = rtf.get("core") or {}
         main = core if core.get("available") else rtf
         stage = main.get("stage_rtf") or {}
@@ -437,7 +413,7 @@ HEADLINE = {
 
 
 def _pad(s: Any, width: int) -> str:
-    """按终端显示宽度右侧补空格。中日韩字符占两列，直接 ljust 会错位。"""
+    """按终端显示宽度右侧补空格（CJK 占两列）。"""
     s = str(s)
     shown = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
     return s + " " * max(width - shown, 1)
@@ -472,11 +448,7 @@ def print_summary(results: Dict[str, Dict[str, Any]], run_dir: Path) -> None:
 
 
 def reextract(name: str, run_dir: Path, metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """从 run_dir 里的产物重新抽一遍指标。
-
-    提取规则改了、或者当时抽漏了（比如正则写错），不用重跑评测，--summarize
-    会走这里从 <任务>.log 和各自的结果文件里补回来。
-    """
+    """从已有产物重新抽取指标（供 --summarize）。"""
     m = dict(metrics)
     log = run_dir / f"{name}.log"
     txt = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
@@ -508,10 +480,7 @@ def reextract(name: str, run_dir: Path, metrics: Dict[str, Any]) -> Dict[str, An
 
 
 def summarize_only(run_dir: Path) -> int:
-    """读 run_dir 下各任务的 metrics_*.json，重新抽一遍指标再打总表。
-
-    run_all.sh 是逐个任务调用本脚本的，所以总表由这一步统一出。
-    """
+    """读取 metrics_*.json，重抽指标并打印总表。"""
     results: Dict[str, Dict[str, Any]] = {}
     for name in TASKS:
         f = run_dir / f"metrics_{name}.json"
@@ -661,7 +630,6 @@ def main(argv: List[str]) -> int:
             res = {"rc": 1, "elapsed_s": 0.0, "log": "-", "stdout": "",
                    "metrics": {"error": str(e)}}
         results[name] = res
-        # 单独落一份，好让 run_all.sh 最后统一汇总（stdout 太大不留）
         (run_dir / f"metrics_{name}.json").write_text(
             json.dumps({k: v for k, v in res.items() if k != "stdout"},
                        ensure_ascii=False, indent=2), encoding="utf-8")

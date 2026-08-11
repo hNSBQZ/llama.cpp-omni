@@ -1,31 +1,20 @@
 #!/bin/bash
+# MiniCPM-o TTS 中文评测（seed-zh）。路径与设备见 pipeline.env / 环境变量。
 set -e
 
-# ============================================================
-# CPP 版 MiniCPM-o 4.5 TTS Evaluation Script (Chinese / seed-zh)
-# ============================================================
-
-# 集中配置：所有外部路径/设备都在 pipeline.env（可用环境变量覆盖）
 source "$(cd "$(dirname "$0")"; pwd)/pipeline.env"
-# WER / SIM 两段与 run_eval_only.sh 共用一份实现，dev_of 也在里面
 source "$(cd "$(dirname "$0")"; pwd)/metrics_stages.sh"
 
 echo "Python: $(command -v python3)"
 
-# llama-omni-tts-eval 运行时需要其构建目录下的 libomni.so 等；CUDA 版还需 CUDA 运行库
 export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB}:${CPP_BUILD_LIB}:${LD_LIBRARY_PATH}"
 
-# 1. 参数设置
 TIME_STR=$(date +%Y%m%d_%H%M%S)
 SEED=${SEED:-42}
 
-# C++ 模型目录（GGUF 格式）
 MODEL_PATH=${MODEL_PATH:-"/path/to/MiniCPM-o-4_5-gguf"}
-# TTS 模型路径覆盖（可选，用于测试量化版本，留空则由 C++ 从 MODEL_PATH 自动查找）
 TTS_MODEL_PATH=${TTS_MODEL_PATH:-"$MODEL_PATH/tts/MiniCPM-o-4_5-tts-F16.gguf"}
-# C++ 推理程序路径
 CPP_BIN=${CPP_BIN:-"/path/to/llama.cpp-omni/build/bin/llama-omni-tts-eval"}
-# ONNX 模型目录（prompt_bundle 提取用）
 ONNX_MODEL_DIR=${ONNX_MODEL_DIR:-"/path/to/Step-Audio-2-mini/token2wav"}
 
 SAVE_DIR=${SAVE_DIR:-"${WORKDIR:-$(cd "$(dirname "$0")"; pwd)}/eval_results/cpp-zh-${TIME_STR}-${SEED}"}
@@ -33,8 +22,6 @@ SAVE_DIR=${SAVE_DIR:-"${WORKDIR:-$(cd "$(dirname "$0")"; pwd)}/eval_results/cpp-
 LANG="zh"
 EVAL_META_PATH=${EVAL_META_PATH:-"/path/to/seedtts_testset_zh/zh/meta.lst"}
 EVAL_DATA_PATH=${EVAL_DATA_PATH:-"/path/to/seedtts_testset_zh/zh"}
-
-# WavLM speaker verification checkpoint
 SPEAKER_CKPT=${SPEAKER_CKPT:-"/path/to/wavlm_large_finetune.pth"}
 
 echo "============================================"
@@ -54,9 +41,7 @@ echo "============================================"
 mkdir -p "$SAVE_DIR"
 
 WORKDIR=$(cd "$(dirname "$0")"; pwd)
-# 无显卡默认单进程（CPU）；有多卡可 GPUS_PER_NODE=8
 GPUS_PER_NODE=${GPUS_PER_NODE:-1}
-# 只跑前 N 条（冒烟/调试用）；默认全量
 NUM_SAMPLES=${NUM_SAMPLES:-10000000}
 EVAL_SCRIPT_DIR=${EVAL_SCRIPT_DIR:-"${WORKDIR}/eval_tools"}
 SPEAKER_VERIF_DIR=${SPEAKER_VERIF_DIR:-"${EVAL_SCRIPT_DIR}/speaker_verification"}
@@ -68,28 +53,21 @@ echo "EVAL_SCRIPT_DIR: ${EVAL_SCRIPT_DIR}"
 echo "S3PRL_REPO:      ${S3PRL_REPO}"
 echo "PARAFORMER:      ${PARAFORMER_MODEL}"
 
-# 日志跟评测产物放在一起，本次运行的目录被归档后仍可排查。
 LOG_BASE="${SAVE_DIR}/logs"
 mkdir -p "$LOG_BASE"
 
-# 构建 TTS_MODEL_PATH 相关的 generate_cpp.py 参数
 TTS_ARG=""
 if [ -n "$TTS_MODEL_PATH" ]; then
     TTS_ARG="--tts-model-path ${TTS_MODEL_PATH}"
 fi
 
-# ============================================================
-# 2. prompt_bundle 预提取（只需执行一次，所有 rank 共享）
-#    - 单独一步先把所有参考音频的 prompt_bundle 提取好
-#    - 后面各 rank 的 generate_cpp.py 会自动跳过已提取的
-# ============================================================
+# --- 1. 预提取 prompt_bundle（各 rank 共享）---
 echo "=== Step 1: Pre-extract prompt_bundles ==="
 BUNDLE_DIR="${SAVE_DIR}/_prompt_bundles"
 mkdir -p "$BUNDLE_DIR"
 
 EXTRACT_LOG="${LOG_BASE}/extract_bundle_${TIME_STR}.log"
 
-# 生成去重的 batch list（NUM_SAMPLES 限制时只预提取会用到的前若干条，避免 CPU 上全量提取 1010 条）
 python3 -c "
 import os, hashlib
 meta_path = '${EVAL_META_PATH}'
@@ -139,9 +117,7 @@ else
     echo "=== All prompt_bundles already cached ==="
 fi
 
-# ============================================================
-# 3. TTS 推理 (多 GPU 并行，每个 GPU 启动一个 C++ 进程)
-# ============================================================
+# --- 2. TTS 推理（每卡一个进程）---
 echo "=== Step 2: C++ TTS Inference (${GPUS_PER_NODE} GPUs) ==="
 echo "  Per-GPU logs: ${LOG_BASE}/cpp_gpu*_${TIME_STR}.log"
 for i in $(seq 0 $((GPUS_PER_NODE - 1)))
@@ -169,26 +145,20 @@ done
 wait
 echo "=== TTS Inference Done ==="
 
-# ============================================================
-# 4. 计算 WER
-# ============================================================
+# --- 3. WER ---
 echo "=== Step 3: WER Calculation ==="
 WER_LOG="${LOG_BASE}/wer_${TIME_STR}.log"
 echo "  Log: ${WER_LOG}"
 wer_stage "$SAVE_DIR" "$EVAL_META_PATH" "$LANG" "$WER_LOG"
 echo "=== WER Calculation Done ==="
 
-# ============================================================
-# 5. 计算音频相似度 (Speaker Similarity)
-# ============================================================
+# --- 4. SIM ---
 echo "=== Step 4: Speaker Similarity ==="
 SIM_LOG="${LOG_BASE}/sim_${TIME_STR}.log"
 echo "  Log: ${SIM_LOG}"
 sim_stage "$SAVE_DIR" "$EVAL_META_PATH" "$SIM_LOG"
 
-# ============================================================
-# 6. 汇总结果
-# ============================================================
+# --- 5. 汇总 ---
 RESULT_FILE="${WORKDIR}/run_cpp_eval_results.txt"
 echo "==============================" >> "$RESULT_FILE"
 echo "EVAL DONE: $(date)" >> "$RESULT_FILE"
