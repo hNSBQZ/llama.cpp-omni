@@ -7,6 +7,8 @@ set -e
 # ============================================================
 
 source "$(cd "$(dirname "$0")"; pwd)/pipeline.env"
+# WER / SIM 两段与 run_tts_eval_cpp_zh.sh 共用一份实现
+source "$(cd "$(dirname "$0")"; pwd)/metrics_stages.sh"
 
 echo "Python: $(command -v python3)"
 
@@ -55,38 +57,7 @@ echo "Found ${wav_count} wav files in SAVE_DIR"
 echo "=== Step 1: WER Calculation ==="
 WER_LOG="${LOG_BASE}/wer_evalonly_${TIME_STR}.log"
 echo "  Log: ${WER_LOG}"
-META_LST="$EVAL_META_PATH"
-LANGUAGE="$LANG"
-
-WAV_WAV_TEXT=$SAVE_DIR/wav_res_ref_text
-SCORE_FILE=$SAVE_DIR/wav_res_ref_text.wer
-
-python3 "${EVAL_SCRIPT_DIR}/get_wav_res_ref_text.py" "$META_LST" "$SAVE_DIR" "$WAV_WAV_TEXT"
-
-timestamp=$(date +%s)
-thread_dir=$SAVE_DIR/thread_metas_wer_$timestamp/
-mkdir -p "$thread_dir"
-num_job=${GPUS_PER_NODE}
-num=$(wc -l < "$WAV_WAV_TEXT")
-num_per_thread=$(expr $num / $num_job + 1)
-split -l $num_per_thread --additional-suffix=.lst -d "$WAV_WAV_TEXT" "$thread_dir/thread-"
-out_dir=$thread_dir/results/
-mkdir -p "$out_dir"
-
-for rank in $(seq 0 $((num_job - 1))); do
-    sub_score_file=$out_dir/thread-0$rank.wer.out
-    CUDA_VISIBLE_DEVICES=$rank python3 "${EVAL_SCRIPT_DIR}/run_wer.py" \
-        "$thread_dir/thread-0$rank.lst" "$sub_score_file" "$LANGUAGE" \
-        >> "${WER_LOG}" 2>&1 &
-done
-wait
-
-rm -f "$WAV_WAV_TEXT"
-rm -f "$SAVE_DIR/merge.out"
-
-cat "$out_dir"/thread-0*.wer.out >> "$out_dir/merge.out"
-python3 "${EVAL_SCRIPT_DIR}/average_wer.py" "$out_dir/merge.out" "$SCORE_FILE"
-
+wer_stage "$SAVE_DIR" "$EVAL_META_PATH" "$LANG" "$WER_LOG"
 echo "=== WER Calculation Done ==="
 
 # ============================================================
@@ -95,32 +66,7 @@ echo "=== WER Calculation Done ==="
 echo "=== Step 2: Speaker Similarity ==="
 SIM_LOG="${LOG_BASE}/sim_evalonly_${TIME_STR}.log"
 echo "  Log: ${SIM_LOG}"
-if [ -f "$SPEAKER_CKPT" ]; then
-    WAV_WAV_TEXT=$SAVE_DIR/wav_res_ref_text
-    SCORE_FILE=$SAVE_DIR/wav_res_ref_text.sim
-
-    python3 "${EVAL_SCRIPT_DIR}/get_wav_res_ref_text.py" "$META_LST" "$SAVE_DIR" "$WAV_WAV_TEXT"
-
-    python3 "${SPEAKER_VERIF_DIR}/verification_pair_list_v2.py" "$WAV_WAV_TEXT" \
-        --model_name wavlm_large \
-        --checkpoint "$SPEAKER_CKPT" \
-        --scores "$SAVE_DIR/wav_res_ref_text.sim.out" \
-        --wav1_start_sr 0 \
-        --wav2_start_sr 0 \
-        --wav1_end_sr -1 \
-        --wav2_end_sr -1 \
-        --device "${SIM_DEVICE:-cuda:0}" \
-        >> "${SIM_LOG}" 2>&1
-
-    rm -f "$WAV_WAV_TEXT"
-    rm -f "$SAVE_DIR/merge.out"
-
-    cat "$SAVE_DIR/wav_res_ref_text.sim.out" | grep -v "avg score" >> "$SAVE_DIR/merge.out"
-    python3 "${SPEAKER_VERIF_DIR}/average.py" "$SAVE_DIR/merge.out" "$SCORE_FILE"
-    echo "=== SIM Calculation Done ==="
-else
-    echo "WARNING: Speaker checkpoint not found at ${SPEAKER_CKPT}, skipping SIM."
-fi
+sim_stage "$SAVE_DIR" "$EVAL_META_PATH" "$SIM_LOG"
 
 # ============================================================
 # 3. 汇总结果
