@@ -147,6 +147,8 @@ async def run_direct_eval(
         "ref_audio": display_path(ref) if ref else None,
         "length_penalty": length_penalty,
         "n_send_items": len(send_items),
+        "send_interval_s": send_interval_s,
+        "speed": speed,
         **(meta_extra or {}),
     }
     (session_dir / "meta.json").write_text(
@@ -234,6 +236,11 @@ async def run_direct_eval(
             "cost_tts_ms",
             "cost_token2wav_ms",
             "stage_cnt",
+            "audio_expected",
+            "audio_ok",
+            "vision_expected",
+            "vision_ok",
+            "media_error",
         ):
             v = getattr(result, k, None)
             if v is not None:
@@ -282,29 +289,42 @@ async def run_direct_eval(
 
     worker_task = asyncio.create_task(_worker())
 
-    for i, item in enumerate(send_items):
-        target = (i * send_interval_s) / speed
-        sleep_s = target - (time.perf_counter() - start_send_wall)
-        if sleep_s > 0:
-            await asyncio.sleep(sleep_s)
-        if chunk_queue.full():
+    try:
+        for i, item in enumerate(send_items):
+            target = (i * send_interval_s) / speed
+            sleep_s = target - (time.perf_counter() - start_send_wall)
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+            if chunk_queue.full():
+                try:
+                    chunk_queue.get_nowait()
+                    chunk_queue.task_done()
+                    dropped["n"] += 1
+                except asyncio.QueueEmpty:
+                    pass
+            await chunk_queue.put((i, item))
+
+        await chunk_queue.put(None)
+        await worker_task
+
+        meta["input_dropped_count"] = dropped["n"]
+        (session_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        if pre_stop_wait_s > 0:
+            await asyncio.sleep(pre_stop_wait_s)
+
+        await asyncio.to_thread(session.duplex_stop)
+    finally:
+        stop_poll.set()
+        poll_thread.join(timeout=2.0)
+        if not worker_task.done():
+            worker_task.cancel()
             try:
-                chunk_queue.get_nowait()
-                chunk_queue.task_done()
-                dropped["n"] += 1
-            except asyncio.QueueEmpty:
+                await worker_task
+            except asyncio.CancelledError:
                 pass
-        await chunk_queue.put((i, item))
-
-    await chunk_queue.put(None)
-    await worker_task
-
-    if pre_stop_wait_s > 0:
-        await asyncio.sleep(pre_stop_wait_s)
-
-    await asyncio.to_thread(session.duplex_stop)
-    stop_poll.set()
-    poll_thread.join(timeout=2.0)
 
     if post_stop_wait_s > 0:
         await asyncio.sleep(post_stop_wait_s)
@@ -357,12 +377,5 @@ async def run_direct_eval(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     _vlog(f"[direct] wrote {display_path(out_path)}")
-
-    try:
-        await asyncio.to_thread(session.full_reinit)
-        _vlog("[direct] full_reinit done")
-    except Exception as e:
-        _vlog(f"[direct] full_reinit failed: {e}")
-        logger.warning("full_reinit failed: %s", e)
 
     return session_dir

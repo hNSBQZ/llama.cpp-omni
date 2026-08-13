@@ -12,6 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <cstdint>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -77,6 +78,12 @@ struct T2WOut {
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    int src_cnt = -1;  // Duplex source frame; immutable across the async pipeline
+    int turn_id = -1;
+    uint64_t producer_seq = 0;
+    int generated_audio_tokens = 0;
+    bool generation_ok = false;
+    uint64_t enqueue_seq = 0;
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
 
@@ -382,12 +389,19 @@ struct omni_context {
         double llm_decode_ms = 0.0;
         double tts_ms = 0.0;
         double token2wav_ms = 0.0;
+        bool   audio_expected = false;
+        bool   audio_ok = true;
+        bool   vision_expected = false;
+        bool   vision_ok = true;
+        bool   media_error = false;
         bool   valid = false;
     } last_chunk_timings;
     // Accumulators for async TTS/t2w of the current SPEAK turn (written by t2w thread).
     double speak_tts_ms_acc = 0.0;
     double speak_t2w_ms_acc = 0.0;
     int    speak_timing_index = -1;
+    std::atomic<uint64_t> tts_producer_seq{0};
+    std::atomic<uint64_t> t2w_enqueue_seq{0};
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;

@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from judge_support import display_path  # noqa: E402
+from run_validity import evaluate_run_validity  # noqa: E402
 
 import websockets
 
@@ -100,7 +101,12 @@ def _read_stage_timing(session_dir: Path) -> Optional[Path]:
 
 
 def _parse_stage_timing(path: Optional[Path]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {"chunk": [], "tts": [], "t2w": []}
+    out: Dict[str, List[Dict[str, Any]]] = {
+        "chunk": [],
+        "tts": [],
+        "t2w": [],
+        "t2w_dequeue": [],
+    }
     if not path or not path.is_file():
         return out
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -229,8 +235,11 @@ def _analyze_rtf(
                 "audio_ms": 0.0,
                 "token2wav": 0.0,
                 "tts": 0.0,
+                "n_tts": 0,
                 "n_wav": 0,
                 "wavs": [],
+                "n_samples": 0,
+                "sample_rates": set(),
                 "has_final": False,
                 "flush_audio_ms": 0.0,
             },
@@ -239,6 +248,9 @@ def _analyze_rtf(
         agg["token2wav"] += float(e.get("token2wav_ms") or 0.0)
         agg["n_wav"] += 1
         agg["wavs"].append(e.get("wav"))
+        agg["n_samples"] += int(e.get("n_samples") or 0)
+        if e.get("sample_rate") is not None:
+            agg["sample_rates"].add(int(e["sample_rate"]))
         if e.get("is_final"):
             agg["has_final"] = True
             agg["flush_audio_ms"] += float(e.get("duration_ms") or 0.0)
@@ -247,6 +259,7 @@ def _analyze_rtf(
         if cnt is None or int(cnt) not in by_cnt:
             continue
         by_cnt[int(cnt)]["tts"] += float(e.get("tts_ms") or 0.0)
+        by_cnt[int(cnt)]["n_tts"] += 1
 
     if len(by_cnt) == 1 and len(t2w_events) > 2:
         warnings.append(
@@ -283,8 +296,16 @@ def _analyze_rtf(
         frames.append({
             "cnt": cnt,
             "mode": c.get("mode", "?"),
+            "n_chunk": 1 if c else 0,
+            "n_tts": agg["n_tts"],
             "n_wav": agg["n_wav"],
             "wavs": agg["wavs"],
+            "n_samples": agg["n_samples"],
+            "sample_rate": (
+                next(iter(agg["sample_rates"]))
+                if len(agg["sample_rates"]) == 1
+                else None
+            ),
             "has_final_wav": bool(agg["has_final"]),
             "flush_audio_ms": round(agg["flush_audio_ms"], 1),
             "audio_ms": round(audio_ms, 1),
@@ -549,6 +570,29 @@ def _analyze_e2e(session_dir: Path) -> Dict[str, Any]:
         }
         integrity["ok"] = not integrity["missing_in_poll"] and not integrity["missing_in_cpp"]
 
+    send_interval_ms = 1000.0
+    meta: Dict[str, Any] = {}
+    meta_path = session_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            meta = _read_json(meta_path)
+            send_interval_ms = float(meta.get("send_interval_s", 1.0)) * 1000.0
+        except (TypeError, ValueError):
+            pass
+    validity = evaluate_run_validity(
+        chunks=chunks,
+        stage=stage,
+        rtf=rtf,
+        wav_integrity=integrity,
+        send_interval_ms=send_interval_ms,
+        input_dropped_count=int(meta.get("input_dropped_count") or 0),
+        causal_latencies_ms=[
+            float(pair["e2e_recv_to_wav_poll_ms"])
+            for pair in pairs_all
+            if pair.get("e2e_recv_to_wav_poll_ms") is not None
+        ],
+    )
+
     turn_first: List[Dict[str, Any]] = []
     if summary_path.exists():
         summary = _read_json(summary_path)
@@ -578,6 +622,7 @@ def _analyze_e2e(session_dir: Path) -> Dict[str, Any]:
         "e2e_empty_text_only_ms": _stats(_lats(pairs_empty, "e2e_recv_to_wav_poll_ms")),
         "rtf": rtf,
         "wav_integrity": integrity,
+        "validity": validity,
         "stage_ms": stage_stats,
         "speak_turn_first_wav_ms": turn_first,
         "pairs_head": pairs[:8],
@@ -591,7 +636,9 @@ def _analyze_e2e(session_dir: Path) -> Dict[str, Any]:
             for p in pairs_empty
         ],
         "metric_primary": "e2e_speak_recv_to_wav_poll_ms.mean_ms",
-        "metric_rtf": "rtf.core.rtf_aggregate",
+        "metric_rtf": (
+            "rtf.core.rtf_aggregate" if validity["eligible_for_pool"] else None
+        ),
         "note": (
             "主指标：SPEAK chunk 进入 worker 处理时刻(t_recv) → 对应 wav 被 poll 到(t_poll)；"
             "按 wav 的 src_cnt 归帧（拿不到才退回 last_speak_chunk_idx），一帧多包只取首包。"

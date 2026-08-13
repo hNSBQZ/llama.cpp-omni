@@ -407,6 +407,19 @@ int main(int argc, char ** argv) {
                             metrics["apm_ms"] = state.octx->last_chunk_timings.apm_ms;
                             metrics["llm_prefill_ms"] = state.octx->last_chunk_timings.llm_prefill_ms;
                             metrics["cost_llm_ms"] = state.octx->last_chunk_timings.llm_decode_ms;
+                            metrics["audio_expected"] = state.octx->last_chunk_timings.audio_expected;
+                            metrics["audio_ok"] = state.octx->last_chunk_timings.audio_ok;
+                            metrics["vision_expected"] = state.octx->last_chunk_timings.vision_expected;
+                            metrics["vision_ok"] = state.octx->last_chunk_timings.vision_ok;
+                            if (state.octx->last_chunk_timings.audio_expected &&
+                                !state.octx->last_chunk_timings.audio_ok) {
+                                metrics["media_error"] = "audio_decode_failed";
+                            } else if (state.octx->last_chunk_timings.vision_expected &&
+                                       !state.octx->last_chunk_timings.vision_ok) {
+                                metrics["media_error"] = "vision_decode_failed";
+                            } else {
+                                metrics["media_error"] = "";
+                            }
                             if (state.octx->last_chunk_timings.tts_ms > 0.0) {
                                 metrics["cost_tts_ms"] = state.octx->last_chunk_timings.tts_ms;
                             }

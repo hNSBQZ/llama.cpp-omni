@@ -7,10 +7,11 @@ import logging
 import os
 import platform
 import signal
+import socket
 import subprocess
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import sys
 from pathlib import Path
@@ -85,6 +86,7 @@ class CppServerProcess:
         n_gpu_layers: int = 99,
         output_dir: Optional[str] = None,
         log_path: Optional[str] = None,
+        ready_timeout_s: float = 300.0,
     ) -> None:
         self.llamacpp_root = llamacpp_root
         self.model_path = model_path
@@ -96,6 +98,7 @@ class CppServerProcess:
             llamacpp_root, f"tools/omni/output_{port}"
         )
         self.log_path = log_path
+        self.ready_timeout_s = max(1.0, float(ready_timeout_s))
         self._process: Optional[subprocess.Popen] = None
         self.base_url = f"http://127.0.0.1:{port}"
 
@@ -109,6 +112,27 @@ class CppServerProcess:
             raise RuntimeError(f"llama-server not found: {server_bin}")
         if not os.path.exists(self.model_path):
             raise RuntimeError(f"LLM model not found: {self.model_path}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", self.port)) == 0:
+                raise RuntimeError(
+                    f"C++ server port {self.port} is already occupied"
+                )
+
+        raw_delay = os.environ.get("RTS_MODEL_LOAD_SLEEP_S", "2").strip()
+        try:
+            model_load_sleep_s = max(0.0, float(raw_delay or "0"))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid RTS_MODEL_LOAD_SLEEP_S={raw_delay!r}"
+            ) from exc
+        if model_load_sleep_s > 0:
+            logger.info(
+                "Waiting %.1fs before loading model on device %s",
+                model_load_sleep_s,
+                self.gpu_id,
+            )
+            time.sleep(model_load_sleep_s)
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
@@ -168,13 +192,18 @@ class CppServerProcess:
                 pass
 
         threading.Thread(target=_log_reader, daemon=True).start()
-        self._wait_health(timeout_s=300)
+        self._wait_health(timeout_s=self.ready_timeout_s)
 
-    def _wait_health(self, timeout_s: int = 300) -> None:
+    def _wait_health(self, timeout_s: float = 300.0) -> None:
         import requests
 
-        no_proxy = {"http": None, "https": None}
-        for i in range(timeout_s):
+        http = requests.Session()
+        http.trust_env = False
+        started = time.monotonic()
+        deadline = started + timeout_s
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
             proc = self._process
             if proc is not None:
                 return_code = proc.poll()
@@ -187,15 +216,23 @@ class CppServerProcess:
                         f"(code={return_code}, log={log_path})"
                     )
             try:
-                r = requests.get(
-                    f"{self.base_url}/health", timeout=2, proxies=no_proxy
+                remaining = max(0.1, deadline - time.monotonic())
+                r = http.get(
+                    f"{self.base_url}/health",
+                    timeout=min(2.0, remaining),
                 )
                 if r.status_code == 200:
-                    logger.info("C++ server ready after %ss", i + 1)
+                    logger.info(
+                        "C++ server ready after %.1fs (%s attempts)",
+                        time.monotonic() - started,
+                        attempts,
+                    )
                     return
             except Exception:
                 pass
-            time.sleep(1)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
         raise RuntimeError(f"C++ server startup timeout ({timeout_s}s)")
 
     def stop(self) -> None:

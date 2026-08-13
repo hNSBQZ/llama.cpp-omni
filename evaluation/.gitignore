@@ -1,6 +1,13 @@
 # 指向数据集和权重的软链接，每台机器各自建
 appendix/
 
+# 内部分析记录，不进分支也不进 baseline
+/rts_*.md
+
+# make_test_case.py 从视频切出来的 RTS 自测输入，本地生成不入库
+judge-final/assets/test_case/
+judge-final/sessions/
+
 # 运行产物
 output/
 */output/

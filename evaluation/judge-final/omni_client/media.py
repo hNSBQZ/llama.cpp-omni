@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -31,10 +31,13 @@ def save_pil_image_to_temp(pil_image, temp_dir: str, prefix: str) -> str:
     return path
 
 
-def cleanup_temp_files(*paths: Optional[str]) -> None:
+def cleanup_temp_files(*paths: Optional[str]) -> List[str]:
+    """删除临时媒体，返回仍需稍后重试清理的路径。"""
+    remaining: List[str] = []
     for p in paths:
         if p and os.path.exists(p):
             try:
                 os.remove(p)
             except OSError:
-                pass
+                remaining.append(p)
+    return remaining

@@ -12,13 +12,15 @@ import subprocess
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 SUITE_ROOT = Path(__file__).resolve().parent
 
-TASKS = ["videomme", "daily-omni", "tts", "rts"]
+# rts 排在最前：几分钟就能跑完，失败时不用等几小时的精度任务，理由见 run_all.sh
+TASKS = ["rts", "videomme", "daily-omni", "tts"]
 ACCURACY_TASKS = ["videomme", "daily-omni", "tts"]
 
 
@@ -34,12 +36,120 @@ def cfg_int(key: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def cfg_float(key: str, default: float) -> float:
+    raw = cfg(key)
+    return float(raw) if raw else default
+
+
 def device_ids() -> List[str]:
     ids = [x.strip() for x in cfg("DEVICE_IDS", "0").split(",") if x.strip()]
     n = cfg_int("DEVICE_COUNT", 0)
     if n > 0:
         ids = ids[:n]
     return ids or ["0"]
+
+
+def rts_device_ids() -> List[str]:
+    raw = cfg("RTS_DEVICE_IDS")
+    if raw:
+        ids = [x.strip() for x in raw.split(",") if x.strip()]
+    elif cfg("RTS_DEVICE_ID"):
+        ids = [cfg("RTS_DEVICE_ID")]
+    else:
+        ids = device_ids()
+    count = cfg_int("RTS_DEVICE_COUNT", 0)
+    if count > 0:
+        if count > len(ids):
+            raise SystemExit(
+                f"[config] RTS_DEVICE_COUNT={count} 超过可用设备数 {len(ids)}"
+            )
+        ids = ids[:count]
+    if not ids:
+        raise SystemExit("[config] RTS 没有可用设备")
+    return ids
+
+
+def rts_videos() -> List[str]:
+    test_case_dir = cfg("RTS_TEST_CASE_DIR")
+    video_dir = cfg("RTS_VIDEO_DIR")
+    if test_case_dir:
+        root = Path(test_case_dir).expanduser()
+        if not root.is_dir():
+            raise SystemExit(f"[config] RTS_TEST_CASE_DIR 不是目录: {root}")
+        candidates = [root, *(path for path in root.iterdir() if path.is_dir())]
+        videos = sorted(
+            str(path.resolve())
+            for path in candidates
+            if any(path.glob("*_test_case_*.wav"))
+            and any(path.glob("*_test_case_*.jpg"))
+        )
+    elif video_dir:
+        root = Path(video_dir).expanduser()
+        if not root.is_dir():
+            raise SystemExit(f"[config] RTS_VIDEO_DIR 不是目录: {root}")
+        extensions = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+        videos = sorted(
+            str(path.resolve())
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in extensions
+        )
+    else:
+        videos = [v for v in cfg("RTS_VIDEO").split() if v]
+    count = cfg_int("RTS_VIDEO_COUNT", 0)
+    if count > 0:
+        if count > len(videos):
+            raise SystemExit(
+                f"[config] RTS_VIDEO_COUNT={count} 超过 RTS_VIDEO 条目数 {len(videos)}"
+            )
+        videos = videos[:count]
+    return videos
+
+
+def rts_input_kind() -> str:
+    return "test_case" if cfg("RTS_TEST_CASE_DIR") else "video"
+
+
+def split_round_robin(items: List[str], n_workers: int) -> List[List[str]]:
+    if n_workers <= 0:
+        raise ValueError("n_workers must be positive")
+    groups: List[List[str]] = [[] for _ in range(n_workers)]
+    for index, item in enumerate(items):
+        groups[index % n_workers].append(item)
+    return groups
+
+
+def split_balanced_contiguous(items: List[str], n_workers: int) -> List[List[str]]:
+    """按视频数量尽量平均分组，各组数量最多相差 1。"""
+    if n_workers <= 0:
+        raise ValueError("n_workers must be positive")
+    if n_workers > len(items):
+        raise ValueError("n_workers cannot exceed item count")
+    base, extra = divmod(len(items), n_workers)
+    groups: List[List[str]] = []
+    offset = 0
+    for worker_id in range(n_workers):
+        size = base + (1 if worker_id < extra else 0)
+        groups.append(items[offset:offset + size])
+        offset += size
+    return groups
+
+
+def rotated_group_assignments(
+    groups: List[List[str]],
+    round_index: int,
+) -> List[List[str]]:
+    """第 r 轮让 worker j 接收 group[(j-r) % n]，并轮换组内顺序。"""
+    n_groups = len(groups)
+    if n_groups <= 0:
+        raise ValueError("groups must not be empty")
+    assignments: List[List[str]] = []
+    for worker_id in range(n_groups):
+        group = list(groups[(worker_id - round_index) % n_groups])
+        if group:
+            shift = round_index % len(group)
+            group = group[shift:] + group[:shift]
+        assignments.append(group)
+    return assignments
 
 
 def require_file(path: str, what: str) -> None:
@@ -298,25 +408,53 @@ def task_rts(args, run_dir: Path) -> Dict[str, Any]:
     model = cfg("RTS_MODEL_LLM") or cfg("MODEL_LLM")
     require_file(model, "RTS_MODEL_LLM")
 
-    videos = [v for v in cfg("RTS_VIDEO").split() if v]
+    videos = rts_videos()
     if not videos:
-        raise SystemExit("[config] RTS_VIDEO 为空")
+        raise SystemExit("[config] RTS 输入集合为空")
+    input_kind = rts_input_kind()
     for v in videos:
-        require_file(v, "RTS_VIDEO")
+        if input_kind == "test_case":
+            if not Path(v).is_dir():
+                raise SystemExit(f"[config] RTS test case 目录不存在: {v}")
+        else:
+            require_file(v, "RTS_VIDEO")
+
+    devices = rts_device_ids()
+    n_workers = min(len(devices), len(videos))
+    devices = devices[:n_workers]
+    assignment_mode = cfg("RTS_ASSIGNMENT_MODE", "round_robin").lower()
+    rotation_rounds = max(1, cfg_int("RTS_ROTATION_ROUNDS", 1))
+    if assignment_mode == "round_robin":
+        if rotation_rounds != 1:
+            raise SystemExit(
+                "[config] RTS_ROTATION_ROUNDS>1 需要 "
+                "RTS_ASSIGNMENT_MODE=rotating_groups"
+            )
+        round_assignments = [split_round_robin(videos, n_workers)]
+    elif assignment_mode == "rotating_groups":
+        if rotation_rounds > n_workers:
+            raise SystemExit(
+                f"[config] RTS_ROTATION_ROUNDS={rotation_rounds} 超过 worker 数 "
+                f"{n_workers}；完整轮换最多 {n_workers} 轮"
+            )
+        groups = split_balanced_contiguous(videos, n_workers)
+        round_assignments = [
+            rotated_group_assignments(groups, round_index)
+            for round_index in range(rotation_rounds)
+        ]
+    else:
+        raise SystemExit(
+            "[config] RTS_ASSIGNMENT_MODE 只支持 round_robin 或 rotating_groups"
+        )
 
     runs_dir = run_dir / "rts_runs"
-    cmd = [cfg("RTS_PYTHON", "python3"), "run_judge_direct.py",
-           "--model", model,
-           "--llamacpp-root", cfg("LLAMACPP_ROOT", str(SUITE_ROOT.parent)),
-           "--video", *videos,
-           "--max-duration", cfg("RTS_MAX_DURATION", "120"),
-           "--runs-dir", str(runs_dir),
-           "--verbose"]
-    dev = cfg("RTS_DEVICE_ID")
-    if dev:
-        cmd += ["--gpu", dev]
-
-    env = base_env({
+    batch_id = datetime.now().strftime("rts_%Y%m%d_%H%M%S_%f")
+    batch_dir = runs_dir / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=False)
+    base_port = cfg_int("RTS_BASE_PORT", 19060)
+    max_retries = max(0, cfg_int("RTS_MAX_RETRIES", 0))
+    min_core_frames = max(1, cfg_int("RTS_MIN_CORE_FRAMES", 30))
+    common_env = base_env({
         "OMNI_SERVER_BIN": cfg("OMNI_SERVER_BIN"),
         "GGML_CANN_WEIGHT_NZ": cfg("GGML_CANN_WEIGHT_NZ", "off"),
         "GGML_CANN_ACL_GRAPH": cfg("GGML_CANN_ACL_GRAPH", "off"),
@@ -324,9 +462,210 @@ def task_rts(args, run_dir: Path) -> Dict[str, Any]:
         "OMNI_T2M_DEVICE": os.environ.get("OMNI_T2M_DEVICE", "gpu:0"),
         "OMNI_VOC_DEVICE": os.environ.get("OMNI_VOC_DEVICE", "gpu:0"),
         "OMNI_SAMPLER_SEED": os.environ.get("OMNI_SAMPLER_SEED", "42"),
+        "RTS_MODEL_LOAD_SLEEP_S": cfg("RTS_MODEL_LOAD_SLEEP_S", "2"),
     })
 
-    res = run_step("rts", cmd, root, env, run_dir / "rts.log")
+    t0 = time.time()
+    worker_results: List[Dict[str, Any]] = []
+    reports: List[Dict[str, Any]] = []
+    assignment_manifest: List[Dict[str, Any]] = []
+    for round_index, assignments in enumerate(round_assignments):
+        round_number = round_index + 1
+        round_dir = batch_dir / f"round_{round_number:02d}"
+        jobs: List[Dict[str, Any]] = []
+        for worker_id, (device, worker_videos) in enumerate(
+            zip(devices, assignments)
+        ):
+            worker_root = round_dir / f"worker_{worker_id}"
+            worker_runs = worker_root / "runs"
+            worker_sessions = worker_root / "sessions"
+            cmd = [
+                cfg("RTS_PYTHON", "python3"),
+                "run_judge_direct.py",
+                "--model", model,
+                "--llamacpp-root", cfg(
+                    "LLAMACPP_ROOT", str(SUITE_ROOT.parent)
+                ),
+                (
+                    "--test-case"
+                    if input_kind == "test_case"
+                    else "--video"
+                ),
+                *worker_videos,
+                "--max-duration", cfg("RTS_MAX_DURATION", "120"),
+                "--ready-timeout-s", cfg("RTS_READY_TIMEOUT_S", "300"),
+                "--send-interval-s", cfg("RTS_SEND_INTERVAL_S", "1"),
+                "--pad-before", cfg("RTS_PAD_BEFORE", "0"),
+                "--pad-after", cfg(
+                    "RTS_PAD_AFTER",
+                    "0" if input_kind == "test_case" else "2",
+                ),
+                "--runs-dir", str(worker_runs),
+                "--sessions-root", str(worker_sessions),
+                "--gpu", str(device),
+                "--cpp-port", str(base_port + worker_id),
+                "--no-auto-port",
+                "--batch-id", batch_id,
+                "--worker-id", str(worker_id),
+                "--rotation-round", str(round_number),
+                "--max-retries", str(max_retries),
+                "--verbose",
+            ]
+            job = {
+                "round": round_number,
+                "worker_id": worker_id,
+                "device_id": device,
+                "port": base_port + worker_id,
+                "videos": worker_videos,
+                "cmd": cmd,
+                "cwd": root,
+                "env": dict(common_env),
+                "log": worker_root / "worker.log",
+                "worker_root": worker_root,
+            }
+            jobs.append(job)
+            assignment_manifest.append({
+                "round": round_number,
+                "worker_id": worker_id,
+                "device_id": device,
+                "server_port": base_port + worker_id,
+                "videos": worker_videos,
+            })
+
+        round_results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(
+                    run_step,
+                    f"rts-r{round_number}-worker-{job['worker_id']}",
+                    job["cmd"],
+                    job["cwd"],
+                    job["env"],
+                    job["log"],
+                ): job
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                result = future.result()
+                item = {
+                    "round": round_number,
+                    "worker_id": job["worker_id"],
+                    "device_id": job["device_id"],
+                    "server_port": job["port"],
+                    "videos": job["videos"],
+                    "rc": result["rc"],
+                    "elapsed_s": result["elapsed_s"],
+                    "log": result["log"],
+                }
+                round_results.append(item)
+                worker_results.append(item)
+        round_results.sort(key=lambda item: int(item["worker_id"]))
+
+        for job in jobs:
+            metas = sorted(
+                (job["worker_root"] / "runs").glob("*/run_meta.json")
+            )
+            if not metas:
+                continue
+            try:
+                worker_meta = json.loads(metas[-1].read_text(encoding="utf-8"))
+            except Exception as exc:
+                print(
+                    f"[rts] 无法读取 worker meta {metas[-1]}: {exc}",
+                    flush=True,
+                )
+                continue
+            for item in worker_meta.get("per_video") or []:
+                session_ref = item.get("session_dir")
+                if not session_ref:
+                    continue
+                session_path = Path(session_ref)
+                if not session_path.is_absolute():
+                    session_path = (root / session_path).resolve()
+                report_path = session_path / "eval_e2e_report.json"
+                try:
+                    reports.append(
+                        json.loads(report_path.read_text(encoding="utf-8"))
+                    )
+                except Exception as exc:
+                    print(
+                        f"[rts] 无法读取 report {report_path}: {exc}",
+                        flush=True,
+                    )
+
+    worker_results.sort(
+        key=lambda item: (int(item["round"]), int(item["worker_id"]))
+    )
+
+    sys.path.insert(0, str(root))
+    try:
+        from judge_support import build_batch_pooled_report  # type: ignore
+    finally:
+        if sys.path[0] == str(root):
+            sys.path.pop(0)
+    pooled = build_batch_pooled_report(
+        reports,
+        min_core_frames=min_core_frames,
+        batch_id=batch_id,
+        worker_results=worker_results,
+        expected_video_count=len(videos) * rotation_rounds,
+    )
+    pooled_path = batch_dir / "batch_pooled_report.json"
+    pooled_path.write_text(
+        json.dumps(pooled, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    manifest = {
+        "batch_id": batch_id,
+        "model": model,
+        "devices": devices,
+        "n_workers": n_workers,
+        "n_videos": len(videos),
+        "n_video_runs": len(videos) * rotation_rounds,
+        "input_kind": input_kind,
+        "test_case_dir": cfg("RTS_TEST_CASE_DIR") or None,
+        "video_dir": cfg("RTS_VIDEO_DIR") or None,
+        "video_count_limit": cfg_int("RTS_VIDEO_COUNT", 0),
+        "assignment_mode": assignment_mode,
+        "rotation_rounds": rotation_rounds,
+        "min_core_frames": min_core_frames,
+        "max_retries": max_retries,
+        "model_load_sleep_s": cfg_float("RTS_MODEL_LOAD_SLEEP_S", 2.0),
+        "send_interval_s": cfg_float("RTS_SEND_INTERVAL_S", 1.0),
+        "pad_before": cfg_int("RTS_PAD_BEFORE", 0),
+        "pad_after": cfg_int(
+            "RTS_PAD_AFTER", 0 if input_kind == "test_case" else 2
+        ),
+        "assignments": assignment_manifest,
+        "worker_results": worker_results,
+        "batch_pooled_report": str(pooled_path),
+    }
+    (batch_dir / "batch_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (batch_dir / "run_meta.json").write_text(
+        json.dumps(
+            {
+                **manifest,
+                "batch_pooled_report": str(pooled_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    score_eligible = bool(
+        (pooled.get("batch_validity") or {}).get("score_eligible")
+    )
+    rc = 0 if score_eligible and all(r["rc"] == 0 for r in worker_results) else 1
+    res: Dict[str, Any] = {
+        "rc": rc,
+        "elapsed_s": round(time.time() - t0, 1),
+        "log": str(batch_dir),
+        "stdout": "",
+        "batch_report": str(pooled_path),
+    }
     res["metrics"] = _collect_rts_metrics(root, runs_dir, res["stdout"])
     return res
 
@@ -348,7 +687,7 @@ def _collect_rts_metrics(judge_root: Path, runs_dir: Path, stdout: str) -> Dict[
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             meta = {}
-        for key in ("batch_avg_report", "session_dir"):
+        for key in ("batch_pooled_report", "batch_avg_report", "session_dir"):
             rel = meta.get(key)
             if not rel:
                 continue
@@ -364,12 +703,20 @@ def _collect_rts_metrics(judge_root: Path, runs_dir: Path, stdout: str) -> Dict[
                     pass
 
     if report:
+        batch_core = report.get("batch_core_rtf")
+        is_batch_report = "batch_validity" in report
+        if batch_core is not None:
+            metrics["均值"] = batch_core
+            metrics["batch_validity"] = report.get("batch_validity")
         rtf = report.get("rtf") or {}
         # 优先用 core 稳态窗口；完整对照仍在原始 report
         core = rtf.get("core") or {}
         main = core if core.get("available") else rtf
         stage = main.get("stage_rtf") or {}
-        metrics["均值"] = main.get("rtf_aggregate")
+        if batch_core is None and not is_batch_report:
+            metrics["均值"] = main.get("rtf_aggregate")
+        elif is_batch_report:
+            metrics["batch_validity"] = report.get("batch_validity")
         if stage:
             metrics["分解"] = " + ".join(
                 f"{k} {v}" for k, v in stage.items())
@@ -539,6 +886,20 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--devices", default=None, help="覆盖 DEVICE_IDS，如 0,1,2,3")
     p.add_argument("--device-count", type=int, default=None,
                    help="覆盖 DEVICE_COUNT")
+    p.add_argument("--rts-devices", default=None,
+                   help="覆盖 RTS_DEVICE_IDS，如 0,1,2,3")
+    p.add_argument("--rts-device-count", type=int, default=None,
+                   help="覆盖 RTS_DEVICE_COUNT")
+    p.add_argument("--rts-video-count", type=int, default=None,
+                   help="只评测 RTS_VIDEO 列表前 N 个，0=全部")
+    p.add_argument("--rts-video-dir", default=None,
+                   help="覆盖 RTS_VIDEO_DIR，按文件名递归扫描测试视频")
+    p.add_argument("--rts-test-case-dir", default=None,
+                   help="覆盖 RTS_TEST_CASE_DIR，直接读取已切分 WAV/JPG")
+    p.add_argument("--rts-assignment-mode", choices=("round_robin", "rotating_groups"),
+                   default=None, help="RTS 视频分配方式")
+    p.add_argument("--rts-rotation-rounds", type=int, default=None,
+                   help="rotating_groups 的轮换轮数")
     p.add_argument("--model", default=None, help="覆盖精度测试的 MODEL_LLM")
     p.add_argument("--rts-model", default=None, help="覆盖 RTS 的 RTS_MODEL_LLM")
     p.add_argument("--skip-rerun", action="store_true",
@@ -565,6 +926,20 @@ def main(argv: List[str]) -> int:
         os.environ["DEVICE_IDS"] = args.devices
     if args.device_count is not None:
         os.environ["DEVICE_COUNT"] = str(args.device_count)
+    if args.rts_devices:
+        os.environ["RTS_DEVICE_IDS"] = args.rts_devices
+    if args.rts_device_count is not None:
+        os.environ["RTS_DEVICE_COUNT"] = str(args.rts_device_count)
+    if args.rts_video_count is not None:
+        os.environ["RTS_VIDEO_COUNT"] = str(args.rts_video_count)
+    if args.rts_video_dir is not None:
+        os.environ["RTS_VIDEO_DIR"] = args.rts_video_dir
+    if args.rts_test_case_dir is not None:
+        os.environ["RTS_TEST_CASE_DIR"] = args.rts_test_case_dir
+    if args.rts_assignment_mode is not None:
+        os.environ["RTS_ASSIGNMENT_MODE"] = args.rts_assignment_mode
+    if args.rts_rotation_rounds is not None:
+        os.environ["RTS_ROTATION_ROUNDS"] = str(args.rts_rotation_rounds)
     if args.model:
         os.environ["MODEL_LLM"] = args.model
     if args.rts_model:
@@ -608,7 +983,11 @@ def main(argv: List[str]) -> int:
     print(f"  eval CLI 目录 : {cfg('EVAL_BIN_DIR')}")
     print(f"  server 仓库   : {cfg('LLAMACPP_ROOT')}")
     print(f"  卡 ({cfg('DEVICE_ENV_VAR')}) : {','.join(ids)}  共 {len(ids)} 张")
-    print(f"  RTS 卡        : {cfg('RTS_DEVICE_ID') or '自动挑空闲'}")
+    print(f"  RTS 卡        : {','.join(rts_device_ids())}")
+    print(f"  RTS 视频数    : {len(rts_videos())}")
+    print(f"  RTS 输入类型  : {rts_input_kind()}")
+    print(f"  RTS 分配      : {cfg('RTS_ASSIGNMENT_MODE', 'round_robin')}  "
+          f"轮数={cfg_int('RTS_ROTATION_ROUNDS', 1)}")
     print(f"  样本数        : videomme={args.smoke_videomme or '全量'}  "
           f"daily-omni={args.smoke_daily_omni or '全量'}  "
           f"tts={args.smoke_tts or '全量'}")

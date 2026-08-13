@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
@@ -50,6 +50,11 @@ class DuplexGenerateResult:
     apm_ms: Optional[float] = None
     llm_prefill_ms: Optional[float] = None
     stage_cnt: Optional[int] = None
+    audio_expected: Optional[bool] = None
+    audio_ok: Optional[bool] = None
+    vision_expected: Optional[bool] = None
+    vision_ok: Optional[bool] = None
+    media_error: Optional[str] = None
 
 
 @dataclass
@@ -72,6 +77,7 @@ class DuplexSession:
         ctx_size: int = 4096,
         n_gpu_layers: int = 99,
         log_path: Optional[str] = None,
+        ready_timeout_s: float = 300.0,
     ) -> None:
         self.llamacpp_root = llamacpp_root
         self.model_dir = model_dir
@@ -97,10 +103,12 @@ class DuplexSession:
             n_gpu_layers=n_gpu_layers,
             output_dir=self._output_dir,
             log_path=log_path,
+            ready_timeout_s=ready_timeout_s,
         )
 
         self._duplex_chunk_counter: int = 0
         self._sent_wav_files: Set[str] = set()
+        self._pending_media: Dict[int, List[str]] = {}
         self._duplex_length_penalty: float = 1.1
         self._last_duplex_mode: Optional[bool] = None
         self._last_media_type: int = 2
@@ -142,14 +150,20 @@ class DuplexSession:
             self.duplex_stop()
         except Exception:
             pass
-        self._server.stop()
-        if self._http is not None:
-            self._http.close()
-            self._http = None
-        if os.path.exists(self._temp_dir):
-            import shutil
+        try:
+            self._server.stop()
+        finally:
+            try:
+                if self._http is not None:
+                    self._http.close()
+                    self._http = None
+            finally:
+                self._cleanup_pending_media()
+                if os.path.exists(self._temp_dir):
+                    import shutil
 
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
+                    shutil.rmtree(self._temp_dir, ignore_errors=True)
+                self._pending_media.clear()
 
     def full_reinit(self) -> None:
         self._round_number = 0
@@ -293,8 +307,28 @@ class DuplexSession:
             timeout=30.0,
         )
         if resp.status_code != 200:
-            logger.error("prefill failed (cnt=%s): %s", cnt, resp.text)
+            raise RuntimeError(
+                f"prefill failed (cnt={cnt}, status={resp.status_code}): {resp.text}"
+            )
+
+    def _release_prefill_media(self, cnt: int) -> None:
+        paths = self._pending_media.get(cnt)
+        if not paths:
             return
+        remaining = media.cleanup_temp_files(*paths)
+        if remaining:
+            self._pending_media[cnt] = remaining
+            logger.warning(
+                "failed to release %s consumed prefill media file(s) for cnt=%s",
+                len(remaining),
+                cnt,
+            )
+        else:
+            self._pending_media.pop(cnt, None)
+
+    def _cleanup_pending_media(self) -> None:
+        for cnt in list(self._pending_media):
+            self._release_prefill_media(cnt)
 
     # duplex API
 
@@ -343,6 +377,12 @@ class DuplexSession:
         frame_list: Optional[list] = None,
         max_slice_nums: int = 1,
     ) -> PrefillResult:
+        if frame_list and len(frame_list) > 1:
+            raise RuntimeError(
+                "MULTI_IMAGE_PREFILL_UNSUPPORTED: "
+                f"one logical prefill frame accepts at most one image, got {len(frame_list)}"
+            )
+
         cnt = self._duplex_chunk_counter
         self._duplex_chunk_counter += 1
 
@@ -360,17 +400,12 @@ class DuplexSession:
             )
             n_vision_images = 1
 
+        pending_paths = [p for p in (temp_audio, temp_image) if p]
+        if pending_paths:
+            self._pending_media.setdefault(cnt, []).extend(pending_paths)
+
         self._call_prefill(temp_audio, temp_image, cnt, max_slice_nums)
 
-        if frame_list and len(frame_list) > 1:
-            for i, frame in enumerate(frame_list[1:], 1):
-                extra_img = media.save_pil_image_to_temp(
-                    frame, self._temp_dir, f"duplex_{cnt}_f{i}"
-                )
-                self._call_prefill("", extra_img, cnt + i, max_slice_nums)
-                n_vision_images += 1
-
-        media.cleanup_temp_files(temp_audio, temp_image)
         return PrefillResult(n_vision_images=n_vision_images, cnt=cnt)
 
     def duplex_generate(self, force_listen: bool = False) -> DuplexGenerateResult:
@@ -386,6 +421,10 @@ class DuplexSession:
             },
             timeout=600.0,
         )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"decode failed (status={resp.status_code}): {resp.text}"
+            )
 
         is_listen = True
         end_of_turn = False
@@ -433,11 +472,21 @@ class DuplexSession:
             except (TypeError, ValueError):
                 return None
 
+        def _b(key: str) -> Optional[bool]:
+            value = metrics.get(key)
+            return value if isinstance(value, bool) else None
+
         stage_cnt = metrics.get("cnt")
-        try:
-            stage_cnt_i = int(stage_cnt) if stage_cnt is not None else None
-        except (TypeError, ValueError):
+        stage_cnt_i: Optional[int] = None
+        if isinstance(stage_cnt, int) and not isinstance(stage_cnt, bool):
+            stage_cnt_i = stage_cnt
+        elif isinstance(stage_cnt, str) and stage_cnt.strip().isdigit():
+            stage_cnt_i = int(stage_cnt.strip())
+        if stage_cnt_i is not None and stage_cnt_i < 0:
             stage_cnt_i = None
+
+        if stage_cnt_i is not None:
+            self._release_prefill_media(stage_cnt_i)
 
         return DuplexGenerateResult(
             is_listen=is_listen,
@@ -453,6 +502,15 @@ class DuplexSession:
             apm_ms=_f("apm_ms"),
             llm_prefill_ms=_f("llm_prefill_ms"),
             stage_cnt=stage_cnt_i,
+            audio_expected=_b("audio_expected"),
+            audio_ok=_b("audio_ok"),
+            vision_expected=_b("vision_expected"),
+            vision_ok=_b("vision_ok"),
+            media_error=(
+                str(metrics["media_error"])
+                if metrics.get("media_error")
+                else None
+            ),
         )
 
     def duplex_stop(self) -> None:

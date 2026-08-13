@@ -399,6 +399,13 @@ def _avg_rtf_stat(reports: List[Dict[str, Any]], *keys: str) -> Dict[str, Any]:
     }
 
 
+def _report_pool_eligible(report: Dict[str, Any]) -> bool:
+    validity = report.get("validity")
+    if not isinstance(validity, dict):
+        return True
+    return bool(validity.get("eligible_for_pool"))
+
+
 def _average_rtf(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     """多视频 RTF 汇总。
 
@@ -406,7 +413,13 @@ def _average_rtf(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     aggregate 与 stage_rtf 用总耗时/总音频重新算，不受各视频音频长短影响。
     core（掐头去尾）同样按帧汇总：只取 role=core 的中间稳态帧。
     """
-    avail = [r for r in reports if isinstance(r.get("rtf"), dict) and r["rtf"].get("available")]
+    avail = [
+        r
+        for r in reports
+        if _report_pool_eligible(r)
+        and isinstance(r.get("rtf"), dict)
+        and r["rtf"].get("available")
+    ]
     if not avail:
         return {"available": False}
 
@@ -501,4 +514,99 @@ def average_latency_reports(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stage_ms": stage,
         "n_videos": len(reports),
         "avg_mode": "unweighted_mean_of_per_video_means",
+    }
+
+
+def build_batch_pooled_report(
+    reports: List[Dict[str, Any]],
+    *,
+    min_core_frames: int,
+    batch_id: str,
+    worker_results: Optional[List[Dict[str, Any]]] = None,
+    expected_video_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """构建跨 worker/video 的 RTS 批次报告。"""
+    pooled = average_latency_reports(reports)
+    invalid_reports: List[Dict[str, Any]] = []
+    realtime_failed: List[Dict[str, Any]] = []
+    per_video: List[Dict[str, Any]] = []
+    for index, report in enumerate(reports):
+        meta = report.get("batch_meta") or {}
+        validity = report.get("validity") or {}
+        item = {
+            "index": index,
+            "video": meta.get("video"),
+            "session_dir": report.get("session_dir"),
+            "worker_id": meta.get("worker_id"),
+            "device_id": meta.get("device_id"),
+            "rotation_round": meta.get("rotation_round"),
+            "attempt": meta.get("attempt"),
+            "validity": validity,
+            "core_frames": int(
+                ((report.get("rtf") or {}).get("core") or {}).get("n_frames") or 0
+            ),
+        }
+        per_video.append(item)
+        if validity and not validity.get("data_valid", False):
+            invalid_reports.append(item)
+        elif validity and not validity.get("realtime_eligible", False):
+            realtime_failed.append(item)
+
+    core = (pooled.get("rtf") or {}).get("core") or {}
+    n_core = int(core.get("n_frames") or 0)
+    expected_count = len(reports) if expected_video_count is None else expected_video_count
+    all_reports_present = len(reports) == int(expected_count)
+    workers_ok = all(
+        int(item.get("rc") or 0) in (0, 4) for item in (worker_results or [])
+    )
+    data_valid = (
+        not invalid_reports
+        and len(reports) > 0
+        and all_reports_present
+        and workers_ok
+    )
+    realtime_eligible = not realtime_failed and len(reports) > 0
+    core_sufficient = n_core >= int(min_core_frames)
+    score_eligible = data_valid and realtime_eligible and core_sufficient
+    batch_core_rtf = core.get("rtf_aggregate") if score_eligible else None
+    fatal_reasons: List[Dict[str, Any]] = []
+    if invalid_reports:
+        fatal_reasons.append(
+            {"code": "VIDEO_DATA_INVALID", "count": len(invalid_reports)}
+        )
+    if not all_reports_present:
+        fatal_reasons.append(
+            {
+                "code": "BATCH_VIDEO_REPORT_COUNT_MISMATCH",
+                "actual": len(reports),
+                "expected": int(expected_count),
+            }
+        )
+    if not workers_ok:
+        fatal_reasons.append({"code": "BATCH_WORKER_FAILED"})
+    if not core_sufficient:
+        fatal_reasons.append(
+            {
+                "code": "BATCH_CORE_FRAME_TOO_FEW",
+                "actual": n_core,
+                "minimum": int(min_core_frames),
+            }
+        )
+
+    return {
+        **pooled,
+        "batch_id": batch_id,
+        "batch_core_rtf": batch_core_rtf,
+        "batch_validity": {
+            "data_valid": data_valid,
+            "realtime_eligible": realtime_eligible,
+            "core_sufficient": core_sufficient,
+            "score_eligible": score_eligible,
+            "fatal_reasons": fatal_reasons,
+            "realtime_failed_count": len(realtime_failed),
+        },
+        "n_core_frames": n_core,
+        "min_core_frames": int(min_core_frames),
+        "per_video": per_video,
+        "workers": worker_results or [],
     }
