@@ -17,8 +17,10 @@ WAV 为 16kHz 单声道 16-bit，每个 1 秒；JPG 为该秒中点抽的一帧�
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import soundfile as sf
@@ -40,6 +42,22 @@ def _to_pcm16(audio: np.ndarray) -> np.ndarray:
     return np.trunc(clipped * 32767.0).astype(np.int16)
 
 
+def _probe_duration_s(video: Path) -> Optional[float]:
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video),
+            ],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return None
+
+
 def make_one(video: Path, out_root: Path, max_duration_s: float) -> Path:
     cfg = VideoChunkerConfig(
         max_duration_s=max_duration_s,
@@ -53,6 +71,19 @@ def make_one(video: Path, out_root: Path, max_duration_s: float) -> Path:
         raise RuntimeError(
             f"音画 chunk 数不一致: {len(audio_chunks)} vs {len(jpegs)} ({video})"
         )
+
+    # 抽帧中途失败时切分器只会停在那里，取音画两边的较小值继续，不报错 —— 机器忙的
+    # 时候真的会发生。这样切出来的是个短一截的数据集，跑起来一切正常，只是评的东西
+    # 少了。所以这里拿视频时长兜一道，宁可报错也不要写出残缺输入。
+    duration_s = _probe_duration_s(video)
+    if duration_s is not None:
+        expected = int(min(duration_s, max_duration_s))
+        if len(audio_chunks) < expected - 1:
+            raise RuntimeError(
+                f"{video.name} 只切出 {len(audio_chunks)} 个 chunk，按 "
+                f"{duration_s:.1f}s 时长应有 {expected} 个。多半是 ffmpeg 抽帧中途"
+                f"失败（机器负载高时会偶发），重跑一次即可"
+            )
 
     stem = video.stem
     out_dir = out_root / f"{stem}_test_case"

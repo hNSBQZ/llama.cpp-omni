@@ -140,7 +140,13 @@ python3 judge-final/scripts/make_test_case.py   # 只需跑一次，生成 RTS �
 ./run_all.sh --tasks videomme,rts --smoke 2
 ./run_all.sh --tasks rts,videomme,daily-omni,tts --full --no-build
 ./run_eval.sh tts --smoke 5
+./run_eval.sh videomme --full --videomme-sample-ratio 0.5
 ```
+
+Video-MME 的比例采样以视频为单位，按 `duration / domain / sub_category` 分层后在每层
+等距取样；`0.5` 会从每个 10 视频分层中固定取 5 个，共 450 视频 / 1350 题。算法不使用
+随机数，同一数据集每次选择相同。也可在 `config.env` 设置 `VIDEOMME_SAMPLE_RATIO`；
+`--smoke` 优先用于链路检查，此时不会再叠加比例采样。
 
 覆盖模型或卡号：
 
@@ -309,5 +315,5 @@ tools/omni/CMakeLists.txt
 离线环境请预先配置好 `WAVLM_LARGE_PT` 与 `S3PRL_REPO`；`run_eval.py` 会把权重链入 s3prl 缓存目录。若日志提示找不到 `wavlm_large.pt`，先修正 `config.env` 再跑。SIM 为单进程 CPU；`--smoke N` 表示**每张卡**前 N 条，若只想总共 N 条请加 `--device-count 1`。
 
 **官方评分**  
-smoke / 子集模式下会跳过官方 Overall（子集无法满足 short/medium/long 各 300 视频的断言）。需要官方分请跑 `--full`。
-
+smoke 的 `head(N)` 模式会跳过官方 Overall，因为它可能截断单个视频。分层比例采样会放宽
+完整性断言，并照常输出同口径的分类准确率和 Overall。

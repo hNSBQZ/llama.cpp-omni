@@ -230,10 +230,11 @@ def task_videomme(args, run_dir: Path) -> Dict[str, Any]:
     cmd = [cfg("EVAL_PYTHON", "python3"), "eval_cpp_pipeline.py",
            "--num-gpus", str(len(ids)),
            "--limit", str(limit),
+           "--sample-ratio", str(args.videomme_sample_ratio),
            "--output", str(out_json)]
     if args.skip_rerun:
         cmd.append("--skip-rerun")
-    # 子集无法过官方评分断言，仅全量保留 scoring
+    # smoke 的 head(N) 可能截断单个视频，不适合跑分类评分。
     if limit > 0:
         cmd.append("--skip-scoring")
 
@@ -254,7 +255,9 @@ def task_videomme(args, run_dir: Path) -> Dict[str, Any]:
 
     res = run_step("videomme", cmd, root, env, run_dir / "videomme.log")
     res["metrics"] = {
-        "n_samples": "全量 2700 题" if limit == 0 else f"前 {limit} 题",
+        "n_samples": (f"前 {limit} 题" if limit > 0 else
+                      ("全量 2700 题" if args.videomme_sample_ratio == 1.0 else
+                       f"分层采样 {args.videomme_sample_ratio:.4g}")),
         "准确率": _grep_last(res["stdout"], r"Accuracy: (\d+/\d+ = [\d.]+%)"),
         "官方Overall": _grep_last(res["stdout"], r"^Overall:\s*([\d.]+%)"),
         "output_json": str(out_json),
@@ -883,6 +886,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--smoke", type=int, default=None,
                    help="统一覆盖三个精度测试的样本数（0=全量）")
     p.add_argument("--full", action="store_true", help="等价于 --smoke 0")
+    p.add_argument("--videomme-sample-ratio", type=float, default=None,
+                   help="Video-MME 按视频分层均匀采样比例，范围 (0, 1]")
     p.add_argument("--devices", default=None, help="覆盖 DEVICE_IDS，如 0,1,2,3")
     p.add_argument("--device-count", type=int, default=None,
                    help="覆盖 DEVICE_COUNT")
@@ -949,6 +954,14 @@ def main(argv: List[str]) -> int:
     args.smoke_videomme = smoke if smoke is not None else cfg_int("SMOKE_VIDEOMME", 0)
     args.smoke_daily_omni = smoke if smoke is not None else cfg_int("SMOKE_DAILY_OMNI", 0)
     args.smoke_tts = smoke if smoke is not None else cfg_int("SMOKE_TTS", 0)
+    args.videomme_sample_ratio = (
+        args.videomme_sample_ratio if args.videomme_sample_ratio is not None
+        else cfg_float("VIDEOMME_SAMPLE_RATIO", 1.0)
+    )
+    if not 0 < args.videomme_sample_ratio <= 1:
+        raise SystemExit("VIDEOMME_SAMPLE_RATIO 必须在 (0, 1] 范围内")
+    if args.smoke_videomme > 0:
+        args.videomme_sample_ratio = 1.0
 
     wanted: List[str] = []
     for t in args.tasks:
@@ -988,7 +1001,10 @@ def main(argv: List[str]) -> int:
     print(f"  RTS 输入类型  : {rts_input_kind()}")
     print(f"  RTS 分配      : {cfg('RTS_ASSIGNMENT_MODE', 'round_robin')}  "
           f"轮数={cfg_int('RTS_ROTATION_ROUNDS', 1)}")
-    print(f"  样本数        : videomme={args.smoke_videomme or '全量'}  "
+    videomme_size = (str(args.smoke_videomme) if args.smoke_videomme else
+                     ("全量" if args.videomme_sample_ratio == 1.0 else
+                      f"分层 {args.videomme_sample_ratio:.4g}"))
+    print(f"  样本数        : videomme={videomme_size}  "
           f"daily-omni={args.smoke_daily_omni or '全量'}  "
           f"tts={args.smoke_tts or '全量'}")
     print(f"  产物目录      : {run_dir}")
@@ -1034,6 +1050,7 @@ def main(argv: List[str]) -> int:
                 "daily-omni": args.smoke_daily_omni,
                 "tts": args.smoke_tts,
             },
+            "VIDEOMME_SAMPLE_RATIO": args.videomme_sample_ratio,
         },
         "results": {
             k: {kk: vv for kk, vv in v.items() if kk != "stdout"}

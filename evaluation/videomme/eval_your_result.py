@@ -151,7 +151,7 @@ def eval_your_results(
 
         for item in your_results_video_type:
 
-            if skip_missing and item["missing"]:
+            if skip_missing and item.get("missing", False):
                 continue
 
             # Get the video category, sub category and question category

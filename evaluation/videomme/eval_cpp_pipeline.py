@@ -31,19 +31,38 @@ from eval_cpp_cli_client import (
     CliUnrecoverable, OmniCliClient, start_all_clients, stop_all_clients,
 )
 from eval_cpp_video_prep import prepare_video_frames, cleanup_frames, cleanup_all_frames
+from stratified_sampling import select_video_ids
 
 logger = logging.getLogger(__name__)
 
 
 # ==================== 数据集加载 ====================
 
-def load_dataset(parquet_path: str = PARQUET_PATH, limit: int = 0) -> pd.DataFrame:
-    """加载 Video-MME parquet 数据集。limit > 0 时只取前 limit 条。"""
+def load_dataset(
+    parquet_path: str = PARQUET_PATH,
+    limit: int = 0,
+    sample_ratio: float = 1.0,
+) -> pd.DataFrame:
+    """加载数据集，并可按视频属性分层、等距采样。"""
     logger.info(f"Loading dataset from {parquet_path}")
     df = pd.read_parquet(parquet_path)
+    if limit > 0 and sample_ratio != 1.0:
+        raise ValueError("--limit and --sample-ratio cannot be used together")
     if limit > 0:
         df = df.head(limit)
         logger.info(f"Limited to first {limit} rows")
+    elif sample_ratio != 1.0:
+        videos = df.drop_duplicates(subset="video_id", keep="first")
+        records = (
+            (row["video_id"], row["duration"], row["domain"], row["sub_category"])
+            for _, row in videos.iterrows()
+        )
+        selected_ids = set(select_video_ids(records, sample_ratio))
+        df = df[df["video_id"].isin(selected_ids)].copy()
+        logger.info(
+            "Stratified sample ratio %.4g selected %d/%d videos and %d questions",
+            sample_ratio, len(selected_ids), len(videos), len(df),
+        )
     logger.info(f"Loaded {len(df)} questions")
     return df
 
@@ -328,6 +347,8 @@ def parse_args():
     parser.add_argument("--video-dir", type=str, default=VIDEO_DATA_DIR, help="Video data directory")
     parser.add_argument("--output", type=str, default=OUTPUT_JSON, help="Output JSON path")
     parser.add_argument("--limit", type=int, default=0, help="Only load first N rows from parquet (0 = all)")
+    parser.add_argument("--sample-ratio", type=float, default=1.0,
+                        help="Stratified video sample ratio in (0, 1] (default: 1)")
     parser.add_argument("--skip-rerun", action="store_true", help="Skip rerun of failed questions")
     parser.add_argument("--skip-scoring", action="store_true", help="Skip scoring after evaluation")
     parser.add_argument("--rerun-gpu", type=int, default=0, help="GPU id for rerun CLI process")
@@ -357,7 +378,7 @@ def main():
     logger.info("=" * 60)
 
     # 1. 加载数据集
-    df = load_dataset(args.parquet, limit=args.limit)
+    df = load_dataset(args.parquet, limit=args.limit, sample_ratio=args.sample_ratio)
     video_groups = group_by_video(df)
     chunks = split_into_chunks(video_groups, args.num_gpus)
 
@@ -464,6 +485,7 @@ def main():
         eval_your_results(
             args.output,
             video_types=["short", "medium", "long"],
+            skip_missing=args.sample_ratio != 1.0,
             return_categories_accuracy=True,
             return_sub_categories_accuracy=True,
             return_task_types_accuracy=True,
