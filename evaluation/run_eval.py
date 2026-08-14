@@ -19,9 +19,9 @@ from typing import Any, Dict, List, Optional
 
 SUITE_ROOT = Path(__file__).resolve().parent
 
-# rts 排在最前：几分钟就能跑完，失败时不用等几小时的精度任务，理由见 run_all.sh
-TASKS = ["rts", "videomme", "daily-omni", "tts"]
-ACCURACY_TASKS = ["videomme", "daily-omni", "tts"]
+# 较短任务优先，Video-MME 最长，放在最后；理由见 run_all.sh。
+TASKS = ["rts", "tts", "daily-omni", "videomme"]
+ACCURACY_TASKS = ["tts", "daily-omni", "videomme"]
 
 
 # ---------------------------------------------------------------- 配置读取

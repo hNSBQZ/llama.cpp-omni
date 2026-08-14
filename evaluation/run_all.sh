@@ -12,10 +12,9 @@ set -uo pipefail
 SUITE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EVAL_SUITE_ROOT="$SUITE_ROOT"
 
-# rts 排在最前：它只要几分钟，而三个精度任务加起来是小时级。速度链路有问题时能立刻
-# 停下来报出去，不用等一整轮跑完；同时也让 RTF 测在卡的空闲状态下，而不是被前面几
-# 小时满载烤热之后。
-TASKS="rts,videomme,daily-omni,tts"
+# 先跑较短的任务，让常见错误尽早返回；Video-MME 最长，放在最后。rts 仍排在最前，
+# 同时保证 RTF 测在卡的空闲状态下，而不是被前面几小时满载之后。
+TASKS="rts,tts,daily-omni,videomme"
 DO_BUILD=1
 KEEP_GOING=0
 PASS_ARGS=()
@@ -36,10 +35,10 @@ while [[ $# -gt 0 ]]; do
   ./run_all.sh --tasks videomme,rts
   ./run_all.sh --devices 0,1,2,3
   ./run_all.sh --no-build
-  ./run_all.sh --keep-going    # rts 失败也继续跑精度任务
+  ./run_all.sh --keep-going    # 任一任务失败后仍继续
 
-任务默认顺序为 rts,videomme,daily-omni,tts。rts 只要几分钟，失败时默认直接停下，
-不再花几个小时跑后面的精度任务。
+任务默认顺序为 rts,tts,daily-omni,videomme。任一任务失败时默认直接停下，
+Video-MME 最长，因此放在最后。
 
 其余参数透传给 run_eval.sh，见 ./run_eval.sh --help
 EOF
@@ -146,8 +145,8 @@ for task in "${RUN_TASKS[@]}"; do
     DONE_TASKS+=("$task")
   else
     FAILED_TASKS+=("$task(rc=$rc)")
-    if [[ "$task" == "rts" && $KEEP_GOING -eq 0 ]]; then
-      ABORTED="rts 失败，跳过后面的精度任务（加 --keep-going 可继续）"
+    if [[ $KEEP_GOING -eq 0 ]]; then
+      ABORTED="$task 失败，跳过后面的任务（加 --keep-going 可继续）"
       warn "$ABORTED"
       break
     fi

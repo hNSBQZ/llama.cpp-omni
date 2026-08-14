@@ -132,13 +132,15 @@ python3 judge-final/scripts/make_test_case.py   # 只需跑一次，生成 RTS �
 ./run_all.sh --full
 ```
 
-任务默认顺序为 `rts,videomme,daily-omni,tts`。rts 只要几分钟，精度三项是小时级，所以速度链路一旦有问题会立刻停下来，不再往下跑；想让它失败后继续跑精度任务加 `--keep-going`。
+任务默认顺序为 `rts,tts,daily-omni,videomme`：较短任务优先，最长的 Video-MME 放在
+最后。任一任务失败都会立即返回，不再继续消耗后续评测时间；需要失败后继续时加
+`--keep-going`。
 
 按需选择任务或跳过编译：
 
 ```bash
 ./run_all.sh --tasks videomme,rts --smoke 2
-./run_all.sh --tasks rts,videomme,daily-omni,tts --full --no-build
+./run_all.sh --tasks rts,tts,daily-omni,videomme --full --no-build
 ./run_eval.sh tts --smoke 5
 ./run_eval.sh videomme --full --videomme-sample-ratio 0.5
 ```
