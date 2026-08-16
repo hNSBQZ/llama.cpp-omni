@@ -9,6 +9,8 @@
 | `tts` | Seed-TTS 中文（2020 条） | WER / SIM(ASV) | `llama-omni-tts-eval` |
 | `rts` | 双工短视频 | RTF / SPEAK→wav 延迟 | `llama-omni-server` |
 
+本文统一将双工实时性能任务称为“RTF 评测”。`rts` 是脚本中的任务 ID，`RTS_*` 是已有环境变量前缀；命令、配置名和产物路径中仍保留这些标识。
+
 四项任务共用 `config.env` 与入口脚本，评测 CLI / server 都在仓库主干里。
 
 ---
@@ -63,12 +65,12 @@ RTS_PYTHON=/absolute/path/to/.venv-eval/bin/python
 
 优先级：命令行参数 > 环境变量 > `config.env`。
 
-RTS 配置项：
+RTF 评测配置项：
 
 - `RTS_TEST_CASE_DIR`：预切分输入根目录，优先级最高。直接读取各子目录中的 `*_test_case_NNNN.wav/.jpg`，不重新解码 MP4、不自行取帧。
 - `RTS_VIDEO` / `RTS_VIDEO_DIR`：仅在 `RTS_TEST_CASE_DIR` 留空时生效的实时解码 MP4 路径，正式评测不走这条。
 - `RTS_VIDEO_COUNT`：最多评测解析后列表中的前 N 个；默认 `0` 不截断。
-- `RTS_DEVICE_IDS` / `RTS_DEVICE_COUNT`：RTS worker 卡号与数量。留空时先回退到单卡项 `RTS_DEVICE_ID`，再回退到通用 `DEVICE_IDS`。worker 数取 `min(卡数, 输入数)`。
+- `RTS_DEVICE_IDS` / `RTS_DEVICE_COUNT`：RTF 评测 worker 的卡号与数量。留空时先回退到单卡项 `RTS_DEVICE_ID`，再回退到通用 `DEVICE_IDS`。worker 数取 `min(卡数, 输入数)`。
 - `RTS_BASE_PORT`：worker 0 的 server 端口，后续 worker 使用 `RTS_BASE_PORT + worker_id`。
 - `RTS_ASSIGNMENT_MODE` / `RTS_ROTATION_ROUNDS`：`round_robin` 单轮交错分配；`rotating_groups` 先连续均衡分组再跨卡轮换，N 轮后每个输入在每张卡上各跑一次。轮数不能超过 worker 数，单卡只能用 `round_robin` + 1 轮。
 - `RTS_SEND_INTERVAL_S`：相邻 frame 的提交间隔，即"实时"的定义。预切分输入同样按这个节奏逐帧发送，不会背靠背灌入。
@@ -80,7 +82,7 @@ RTS 配置项：
 
 为保证输入之间状态隔离，**同一 worker 的相邻输入之间会停止并重启 C++ server、重新加载模型**，而不只是清空 KV cache。最后一个输入完成后直接停止，不再多重启一次。
 
-RTS 自测输入需要先生成一次（结果在 `.gitignore` 里，不入库）：
+RTF 评测的自测输入需要先生成一次（结果在 `.gitignore` 里，不入库）：
 
 ```bash
 python3 judge-final/scripts/make_test_case.py
@@ -122,7 +124,7 @@ appendix/
 
 ```bash
 cd evaluation
-python3 judge-final/scripts/make_test_case.py   # 只需跑一次，生成 RTS 输入
+python3 judge-final/scripts/make_test_case.py   # 只需跑一次，生成 RTF 评测输入
 ./run_all.sh --smoke 2
 ```
 
@@ -202,7 +204,7 @@ output/<时间戳>/
 | WER | `tts_seed/wav_res_ref_text.wer` 末尾 `WER:` / `WER_NORMALIZED:` |
 | SIM | `tts_seed/wav_res_ref_text.sim` 的 `ASV:` / `ASV-var:` |
 | RTF、SPEAK→wav 延迟 | 批次口径见 `rts_runs/<批次>/batch_pooled_report.json`，单个输入见对应 session 的 `eval_e2e_report.json` |
-| RTS 有效性 | `batch_pooled_report.json` 的 `batch_validity`，不通过时不出主 RTF |
+| RTF 有效性 | `batch_pooled_report.json` 的 `batch_validity`，不通过时不出主 RTF |
 
 重新打印某次汇总：
 
@@ -227,18 +229,22 @@ compute = max(VPM, APM) + LLM_prefill + LLM_decode + TTS + token2wav
 输入是一组不公开的预切分音视频片段，评测流程与本目录的代码一致，只有三处配置不同：
 
 - **输入集合**：多个片段，内容和数量暂不公布。
-- **多卡轮换**：`RTS_ASSIGNMENT_MODE=rotating_groups`，输入分组后跨卡轮换，轮数等于卡数，每个输入在每张卡上各跑一次，抵消卡间差异。
+- **多卡轮换**：`RTS_ASSIGNMENT_MODE=rotating_groups`。每个 worker 使用单卡时，输入分组后跨卡轮换，轮数等于卡数，每个输入在每张卡上各跑一次，以抵消卡间差异。若服务使用多卡张量并行（TP）或流水线并行（PP），评测会根据选手实现的默认并行策略重新划分设备组，并相应调整样本分配和轮转次数，不再按物理卡数逐卡轮转。
 - **core 帧门槛**：`RTS_MIN_CORE_FRAMES` 取远高于模板里那个 `3` 的值，靠多输入池化满足。
 
 成绩是整批的 pooled 值 `Σ 所有合法 core 的 compute / Σ 对应音频`，不是先算每个输入的 RTF 再取平均——后者会让只有几帧的短输入和几十帧的长输入等权。
 
-每个输入还要通过有效性检查才会进入汇总，任一输入不合法则整批不出成绩。检查的是归帧和因果关系是否自洽，例如：输入 chunk 有没有被丢弃、模态编码有没有静默失败、SPEAK 帧是否都产出了 WAV、WAV 是否归到了正确的源帧、是否出现负的因果延迟、非尾帧 TTS 的 token 数是否正常。这些都是异步流水线出竞态时的特征，不属于性能指标，但只有它们成立，RTF 才有意义。
+每个输入还要通过有效性检查才会进入自动汇总；任一输入不合法时，本次自动流程不会产出整批成绩，评测人员会结合提交材料和实现进一步复核。检查的是归帧和因果关系是否自洽，例如：输入 chunk 有没有被丢弃、模态编码有没有静默失败、SPEAK 帧是否都产出了 WAV、WAV 是否归到了正确的源帧、是否出现负的因果延迟、非尾帧 TTS 的 token 数是否正常。这些都是异步流水线出竞态时的特征，不属于性能指标，但需要确认这些关系成立，RTF 才有意义。
 
-#### 计时口径不得改动
+#### 计时口径与接口兼容性
 
-RTF 的分子来自 server 上报的各阶段耗时（`vpm_ms` / `apm_ms` / `llm_prefill_ms` / `cost_llm_ms` 走 SSE metrics，`tts_ms` / `token2wav_ms` 走 `stage_timing.jsonl`）。这些字段的含义、计时起止点和上报时机都属于评测口径，**优化实现可以改，计时本身不能改**。
+RTF 的分子来自 server 上报的各阶段耗时（`vpm_ms` / `apm_ms` / `llm_prefill_ms` / `cost_llm_ms` 走 SSE metrics，`tts_ms` / `token2wav_ms` 走 `stage_timing.jsonl`）。这些字段的含义、计时起止点和上报时机都属于评测口径。直接接入本套件自动评测时，应保持现有计时字段及其含义兼容；架构级改动确实无法兼容时，按下述方式提供材料复核。
 
-正式评测会对上报的耗时做核对，也会人工复核 diff。上报值与实际执行对不上的提交按不合规处理。
+正式评测会核对上报耗时并人工复核 diff。发现上报值与实际执行不一致时，会结合实现和提交材料确认原因及结果是否仍可核验。
+
+保持上述服务接口、流水线事件编号和计时字段兼容的提交，将按本套件自动接入评分。自动流程未通过时，主办方仍会按仓库根目录 `SUBMISSION_GUIDE.md` 第 1.1 节复核提交材料、实现及结果。若整体调度架构发生重大调整，确实无法保留原有异步流水线、事件或帧编号、阶段划分或计时上报方式，可按该指南第 1.2 节“架构级改动的补充复核材料”提供说明，由工作人员人工复核并执行。
+
+人工复核不改变官方 RTF 的目标口径。自定义测量仍须覆盖等价的模型计算阶段，使用对应音频实际时长作为分母，说明 core 帧筛选、预热和尾帧处理、pooled 聚合及有效性判定，并提供从原始计时记录到最终结果的可复现过程。材料不足时，主办方可要求补充说明；最终仍无法确认口径等价或结果可比时，相关结果可能不予采用。
 
 #### 自测数值怎么看
 
@@ -280,9 +286,9 @@ python3 judge-final/scripts/make_test_case.py
 - 四个任务均成功结束，无 CLI 超时/反复重启
 - Video-MME / Daily-Omni 无明显大量空答案或纯换行
 - TTS 能生成 wav 并产出 WER/SIM
-- RTS 输出 RTF，且批次报告里 `batch_validity` 的 `data_valid` 与 `realtime_eligible` 均为 `true`
+- RTF 评测能输出指标，且批次报告里 `batch_validity` 的 `data_valid` 与 `realtime_eligible` 均为 `true`
 
-RTS 这一项最值得关注：`batch_pooled_report.json` 的 `batch_validity` 会列出判定不通过的原因。它不通过说明双工链路存在归帧或竞态问题，正式评测同样不会给出成绩。线上把 rts 排在第一位跑，改动没验证过就提交，等于把几个小时的机时浪费在必然失败的一轮上。
+RTF 评测最值得关注：`batch_pooled_report.json` 的 `batch_validity` 会列出判定不通过的原因。它不通过通常说明双工链路可能存在归帧或竞态问题，本套件的自动流程不会直接给出成绩，应优先根据报告排查；若属于架构级改动导致无法兼容自动流程，则按 `SUBMISSION_GUIDE.md` 第 1.2 节提供补充复核材料。线上会优先运行 RTF 评测，未充分自测的改动可能会提前终止后续任务并占用较多评测时间。
 
 自测只验证流程，不预测成绩，原因见上一节的 RTF 口径。
 
@@ -305,7 +311,7 @@ tools/omni/CMakeLists.txt
 ## 6. 常见问题
 
 **Python 环境**  
-精度与 TTS 打分用 `EVAL_PYTHON`，RTS 用 `RTS_PYTHON`，可指向同一 venv。PyTorch 需按平台单独安装。
+精度与 TTS 打分用 `EVAL_PYTHON`，RTF 评测用 `RTS_PYTHON`，可指向同一 venv。PyTorch 需按平台单独安装。
 
 **F16 权重**  
 必须保持 `GGML_CANN_WEIGHT_NZ=off`，否则可能出现空串、换行复读等异常输出。
